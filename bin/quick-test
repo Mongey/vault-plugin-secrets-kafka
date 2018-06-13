@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -e
+
+export VAULT_ADDR=http://localhost:8200
+
+TTL=1000
+ADMINNAME="ConorAdmin"
+DATA=$(vault write -format=json pki/issue/kafka-clients common_name="$ADMINNAME" ttl=$TTL | jq -r .data)
+
+echo "Hello $NAME"
+PRIVATE_KEY=$(printf "%s" "$DATA" | jq -r .private_key)
+CERT=$(printf "%s" "$DATA" | jq -r .certificate)
+CA=$(printf "%s" "$DATA" | jq -r .issuing_ca)
+
+echo "  Configuring Provider"
+vault write kafka/config/access address="localhost:9092" ca_certificate="$CA" client_certificate="$CERT" client_key="$PRIVATE_KEY"
+echo "  Writing Policy"
+vault write kafka/roles/read-all-topics policy="$(cat bin/policy.json)"
+
+echo "  Generating read only certs"
+NAME=$(vault read -field=user kafka/creds/read-all-topics)
+echo "Your user is $NAME"
+DATA=$(vault write -format=json pki/issue/kafka-clients common_name="$NAME" ttl=$TTL | jq -r .data)
+printf "%s" "$DATA" | jq -r .private_key > ~/go/src/github.com/Mongey/private.key
+printf "%s" "$DATA" | jq -r .certificate > ~/go/src/github.com/Mongey/client.cert
+printf "%s" "$DATA" | jq -r .issuing_ca  > ~/go/src/github.com/Mongey/ca.cert
