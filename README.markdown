@@ -7,6 +7,8 @@ certificate for a Kafka client.
 
 Use this in combination with the vault pki backend.
 
+## Pre-Install
+
 ## 🔌 Installation
 
 * Download the plugin to Vault's plugin directory.
