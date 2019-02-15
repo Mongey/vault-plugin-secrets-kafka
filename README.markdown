@@ -1,5 +1,7 @@
 # `[WIP] vault-plugin-kafka-secret`
 
+[![CircleCI](https://circleci.com/gh/Mongey/vault-plugin-secrets-kafka.svg?style=svg)](https://circleci.com/gh/Mongey/vault-plugin-secrets-kafka)
+
 A Vault plugin for generating credentials for Apache Kafka clients.
 
 Generates a dynamic username and ACL that can be used to create a uniq SSL
