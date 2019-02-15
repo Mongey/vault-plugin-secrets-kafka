@@ -91,6 +91,8 @@ func getCassandraBaseType(name string) Type {
 		return TypeFloat
 	case "int":
 		return TypeInt
+	case "tinyint":
+		return TypeTinyInt
 	case "timestamp":
 		return TypeTimestamp
 	case "uuid":
@@ -189,6 +191,20 @@ func splitCompositeTypes(name string) []string {
 		parts = append(parts, strings.TrimSpace(segment))
 	}
 	return parts
+}
+
+func apacheToCassandraType(t string) string {
+	t = strings.Replace(t, apacheCassandraTypePrefix, "", -1)
+	t = strings.Replace(t, "(", "<", -1)
+	t = strings.Replace(t, ")", ">", -1)
+	types := strings.FieldsFunc(t, func(r rune) bool {
+		return r == '<' || r == '>' || r == ','
+	})
+	for _, typ := range types {
+		t = strings.Replace(t, typ, getApacheCassandraType(typ).String(), -1)
+	}
+	// This is done so it exactly matches what Cassandra returns
+	return strings.Replace(t, ",", ", ", -1)
 }
 
 func getApacheCassandraType(class string) Type {

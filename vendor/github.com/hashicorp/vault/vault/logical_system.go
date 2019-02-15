@@ -536,6 +536,11 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 						Type:        framework.TypeString,
 						Description: strings.TrimSpace(sysHelp["lease_id"][0]),
 					},
+					"sync": &framework.FieldSchema{
+						Type:        framework.TypeBool,
+						Default:     true,
+						Description: strings.TrimSpace(sysHelp["revoke-sync"][0]),
+					},
 				},
 
 				Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -571,6 +576,11 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 					"prefix": &framework.FieldSchema{
 						Type:        framework.TypeString,
 						Description: strings.TrimSpace(sysHelp["revoke-prefix-path"][0]),
+					},
+					"sync": &framework.FieldSchema{
+						Type:        framework.TypeBool,
+						Default:     true,
+						Description: strings.TrimSpace(sysHelp["revoke-sync"][0]),
 					},
 				},
 
@@ -1182,12 +1192,17 @@ func (b *SystemBackend) handleCORSDelete(ctx context.Context, req *logical.Reque
 }
 
 func (b *SystemBackend) handleTidyLeases(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	err := b.Core.expiration.Tidy()
-	if err != nil {
-		b.Backend.Logger().Error("failed to tidy leases", "error", err)
-		return handleErrorNoReadOnlyForward(err)
-	}
-	return nil, err
+	go func() {
+		err := b.Core.expiration.Tidy()
+		if err != nil {
+			b.Backend.Logger().Error("failed to tidy leases", "error", err)
+			return
+		}
+	}()
+
+	resp := &logical.Response{}
+	resp.AddWarning("Tidy operation successfully started. Any information from the operation will be printed to Vault's server logs.")
+	return logical.RespondWithStatusCode(resp, req, http.StatusAccepted)
 }
 
 func (b *SystemBackend) invalidate(ctx context.Context, key string) {
@@ -1451,6 +1466,9 @@ func (b *SystemBackend) handleCapabilities(ctx context.Context, req *logical.Req
 	for _, path := range paths {
 		pathCap, err := b.Core.Capabilities(ctx, token, path)
 		if err != nil {
+			if !strings.HasSuffix(req.Path, "capabilities-self") && errwrap.Contains(err, logical.ErrPermissionDenied.Error()) {
+				return nil, &logical.StatusBadRequest{Err: "invalid token"}
+			}
 			return nil, err
 		}
 		ret.Data[path] = pathCap
@@ -2016,8 +2034,9 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 		}
 	}
 
-	description := data.Get("description").(string)
-	if description != "" {
+	if rawVal, ok := data.GetOk("description"); ok {
+		description := rawVal.(string)
+
 		oldDesc := mountEntry.Description
 		mountEntry.Description = description
 
@@ -2298,27 +2317,37 @@ func (b *SystemBackend) handleRevoke(ctx context.Context, req *logical.Request, 
 			logical.ErrInvalidRequest
 	}
 
-	// Invoke the expiration manager directly
-	if err := b.Core.expiration.Revoke(leaseID); err != nil {
+	if data.Get("sync").(bool) {
+		// Invoke the expiration manager directly
+		if err := b.Core.expiration.Revoke(ctx, leaseID); err != nil {
+			b.Backend.Logger().Error("lease revocation failed", "lease_id", leaseID, "error", err)
+			return handleErrorNoReadOnlyForward(err)
+		}
+
+		return nil, nil
+	}
+
+	if err := b.Core.expiration.LazyRevoke(leaseID); err != nil {
 		b.Backend.Logger().Error("lease revocation failed", "lease_id", leaseID, "error", err)
 		return handleErrorNoReadOnlyForward(err)
 	}
-	return nil, nil
+
+	return logical.RespondWithStatusCode(nil, nil, http.StatusAccepted)
 }
 
 // handleRevokePrefix is used to revoke a prefix with many LeaseIDs
 func (b *SystemBackend) handleRevokePrefix(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	return b.handleRevokePrefixCommon(req, data, false)
+	return b.handleRevokePrefixCommon(req, data, false, data.Get("sync").(bool))
 }
 
 // handleRevokeForce is used to revoke a prefix with many LeaseIDs, ignoring errors
 func (b *SystemBackend) handleRevokeForce(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	return b.handleRevokePrefixCommon(req, data, true)
+	return b.handleRevokePrefixCommon(req, data, true, true)
 }
 
 // handleRevokePrefixCommon is used to revoke a prefix with many LeaseIDs
 func (b *SystemBackend) handleRevokePrefixCommon(
-	req *logical.Request, data *framework.FieldData, force bool) (*logical.Response, error) {
+	req *logical.Request, data *framework.FieldData, force, sync bool) (*logical.Response, error) {
 	// Get all the options
 	prefix := data.Get("prefix").(string)
 
@@ -2327,13 +2356,18 @@ func (b *SystemBackend) handleRevokePrefixCommon(
 	if force {
 		err = b.Core.expiration.RevokeForce(prefix)
 	} else {
-		err = b.Core.expiration.RevokePrefix(prefix)
+		err = b.Core.expiration.RevokePrefix(prefix, sync)
 	}
 	if err != nil {
 		b.Backend.Logger().Error("revoke prefix failed", "prefix", prefix, "error", err)
 		return handleErrorNoReadOnlyForward(err)
 	}
-	return nil, nil
+
+	if sync {
+		return nil, nil
+	}
+
+	return logical.RespondWithStatusCode(nil, nil, http.StatusAccepted)
 }
 
 // handleAuthTable handles the "auth" endpoint to provide the auth table
@@ -3471,15 +3505,20 @@ func (b *SystemBackend) pathInternalUIMountsRead(ctx context.Context, req *logic
 		isAuthed = true
 
 		var entity *identity.Entity
+		var te *logical.TokenEntry
 		// Load the ACL policies so we can walk the prefix for this mount
-		acl, _, entity, err = b.Core.fetchACLTokenEntryAndEntity(req)
+		acl, te, entity, _, err = b.Core.fetchACLTokenEntryAndEntity(req)
 		if err != nil {
 			return nil, err
 		}
 		if entity != nil && entity.Disabled {
+			b.logger.Warn("permission denied as the entity on the token is disabled")
 			return nil, logical.ErrPermissionDenied
 		}
-
+		if te != nil && te.EntityID != "" && entity == nil {
+			b.logger.Warn("permission denied as the entity on the token is invalid")
+			return nil, logical.ErrPermissionDenied
+		}
 	}
 
 	hasAccess := func(me *MountEntry) bool {
@@ -3553,12 +3592,17 @@ func (b *SystemBackend) pathInternalUIMountRead(ctx context.Context, req *logica
 	resp.Data["path"] = me.Path
 
 	// Load the ACL policies so we can walk the prefix for this mount
-	acl, _, entity, err := b.Core.fetchACLTokenEntryAndEntity(req)
+	acl, te, entity, _, err := b.Core.fetchACLTokenEntryAndEntity(req)
 	if err != nil {
 		return nil, err
 	}
 	if entity != nil && entity.Disabled {
+		b.logger.Warn("permission denied as the entity on the token is disabled")
 		return errResp, logical.ErrPermissionDenied
+	}
+	if te != nil && te.EntityID != "" && entity == nil {
+		b.logger.Warn("permission denied as the entity on the token is invalid")
+		return nil, logical.ErrPermissionDenied
 	}
 
 	if !hasMountAccess(acl, me.Path) {
@@ -3574,12 +3618,17 @@ func (b *SystemBackend) pathInternalUIResultantACL(ctx context.Context, req *log
 		return nil, nil
 	}
 
-	acl, _, entity, err := b.Core.fetchACLTokenEntryAndEntity(req)
+	acl, te, entity, _, err := b.Core.fetchACLTokenEntryAndEntity(req)
 	if err != nil {
 		return nil, err
 	}
 
 	if entity != nil && entity.Disabled {
+		b.logger.Warn("permission denied as the entity on the token is disabled")
+		return logical.ErrorResponse(logical.ErrPermissionDenied.Error()), nil
+	}
+	if te != nil && te.EntityID != "" && entity == nil {
+		b.logger.Warn("permission denied as the entity on the token is invalid")
 		return logical.ErrorResponse(logical.ErrPermissionDenied.Error()), nil
 	}
 
@@ -3686,6 +3735,7 @@ func sanitizeMountPath(path string) string {
 
 func checkListingVisibility(visibility ListingVisibilityType) error {
 	switch visibility {
+	case ListingVisibilityDefault:
 	case ListingVisibilityHidden:
 	case ListingVisibilityUnauth:
 	default:
@@ -3934,6 +3984,17 @@ at the end of the lease period if not renewed. However, in some cases
 you may want to force an immediate revocation. This endpoint can be
 used to revoke the secret with the given Lease ID.
 		`,
+	},
+
+	"revoke-sync": {
+		"Whether or not to perform the revocation synchronously",
+		`
+If false, the call will return immediately and revocation will be queued; if it
+fails, Vault will keep trying. If true, if the revocation fails, Vault will not
+automatically try again and will return an error. For revoke-prefix, this
+setting will apply to all leases being revoked. For revoke-force, since errors
+are ignored, this setting is not supported.
+`,
 	},
 
 	"revoke-prefix": {
