@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"testing"
@@ -40,6 +41,8 @@ func testAccStepConfig(t *testing.T, uri string) logicaltest.TestStep {
 	if password == "" {
 		t.Fatal("KAFKA_ROOT_CERTIFICATE must be set in the env")
 	}
+	sDec, _ := base64.StdEncoding.DecodeString(password)
+	password = string(sDec)
 
 	return logicaltest.TestStep{
 		Operation: logical.UpdateOperation,
