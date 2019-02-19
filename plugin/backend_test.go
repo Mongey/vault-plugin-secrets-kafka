@@ -34,8 +34,12 @@ func testAccStepRole(t *testing.T, role string) logicaltest.TestStep {
 		},
 	}
 }
+
 func testAccStepConfig(t *testing.T, uri string) logicaltest.TestStep {
 	password := os.Getenv("KAFKA_ROOT_CERTIFICATE")
+	if password == "" {
+		t.Fatal("KAFKA_ROOT_CERTIFICATE must be set in the env")
+	}
 
 	return logicaltest.TestStep{
 		Operation: logical.UpdateOperation,
