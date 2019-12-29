@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+export VAULT_ADDR=http://localhost:8200
+
+echo "PKI Enable"
+vault secrets enable pki
+vault write pki/root/generate/internal common_name=kafka-cluster
+echo "Kafka role"
+vault write pki/roles/kafka-clients allow_any_name=true
+echo "==> Ready!"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -ex
 
 MNT_PATH="kafka"
 PLUGIN_NAME="vault-plugin-secrets-kafka"
@@ -45,8 +45,9 @@ function cleanup {
 }
 trap cleanup EXIT
 
+echo "waaaaaaaaaaat"
 echo "    Authing"
-vault auth root &>/dev/null
+#vault auth root
 
 echo "--> Building"
 go build -o "$SCRATCH/plugins/$PLUGIN_NAME"

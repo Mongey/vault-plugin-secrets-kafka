@@ -1,0 +1,18 @@
+#!/bin/bash
+set -e
+
+export VAULT_ADDR=http://localhost:8200
+PLUGIN_NAME="vault-plugin-secrets-kafka"
+MNT_PATH="kafka"
+
+echo "---> Building"
+GOOS=linux GOARCH=amd64 go build -o "docker/plugins/$PLUGIN_NAME"
+SHASUM=$(shasum -a 256 "docker/plugins/$PLUGIN_NAME" | cut -d " " -f1)
+
+echo "---->Registering plugin"
+vault write sys/plugins/catalog/$PLUGIN_NAME \
+  sha_256="$SHASUM" \
+  command="$PLUGIN_NAME"
+
+echo "    Mouting plugin"
+vault secrets enable -path=$MNT_PATH -plugin-name=$PLUGIN_NAME plugin

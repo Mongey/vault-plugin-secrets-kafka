@@ -4,7 +4,7 @@ set -e
 export VAULT_ADDR=http://localhost:8200
 
 TTL=1000
-ADMINNAME="ConorAdmin"
+ADMINNAME="VaultKafkaPlugin"
 DATA=$(vault write -format=json pki/issue/kafka-clients common_name="$ADMINNAME" ttl=$TTL | jq -r .data)
 
 echo "Hello $NAME"
