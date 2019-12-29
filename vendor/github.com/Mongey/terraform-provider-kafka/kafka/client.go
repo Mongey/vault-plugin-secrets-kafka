@@ -23,30 +23,26 @@ type Client struct {
 	supportedAPIs map[int]int
 }
 
-func (c *Config) String() string {
-	return fmt.Sprintf("BootstrapServers: %s\nTimeout: %d,\nTLS: %v,SkipVerify: %v", *c.BootstrapServers, c.Timeout, c.TLSEnabled, c.SkipTLSVerify)
-}
-
 func NewClient(config *Config) (*Client, error) {
-	bootstrapServers := *(config.BootstrapServers)
+	sarama.Logger = log.New(os.Stdout, "[TRACE] [Sarama]", log.LstdFlags)
 
+	log.Printf("[INFO] configuring bootstrap_servers %v", config)
+	bootstrapServers := *(config.BootstrapServers)
 	if bootstrapServers == nil {
 		return nil, fmt.Errorf("No bootstrap_servers provided")
 	}
 
 	kc, err := config.newKafkaConfig()
 	if err != nil {
-		log.Println("[ERROR] Error creating kafka client")
+		log.Printf("[ERROR] Error creating kafka client %v", err)
 		return nil, err
 	}
 
 	c, err := sarama.NewClient(bootstrapServers, kc)
 	if err != nil {
-		log.Println("[ERROR] Error connecting to kafka")
+		log.Printf("[ERROR] Error connecting to kafka %s", err)
 		return nil, err
 	}
-
-	sarama.Logger = log.New(os.Stdout, "[TRACE] [Sarama]", log.LstdFlags)
 
 	client := &Client{
 		client:      c,
@@ -63,8 +59,12 @@ func NewClient(config *Config) (*Client, error) {
 	return client, nil
 }
 
+func (c *Client) SaramaClient() sarama.Client {
+	return c.client
+}
+
 func (c *Client) populateAPIVersions() {
-	log.Printf("[DEBUG] retrieving supported APIs from broker")
+	log.Printf("[DEBUG] retrieving supported APIs from broker: %s", c.config.BootstrapServers)
 	broker, err := c.client.Controller()
 	if err != nil {
 		log.Printf("[ERROR] Unable to populate supported API versions. Error retrieving controller: %s", err)
@@ -87,7 +87,6 @@ func (c *Client) populateAPIVersions() {
 
 func (c *Client) DeleteTopic(t string) error {
 	broker, err := c.client.Controller()
-
 	if err != nil {
 		return err
 	}
@@ -98,7 +97,6 @@ func (c *Client) DeleteTopic(t string) error {
 		Timeout: timeout,
 	}
 	res, err := broker.DeleteTopics(req)
-
 	if err == nil {
 		for k, e := range res.TopicErrorCodes {
 			if e != sarama.ErrNoError {
@@ -117,7 +115,6 @@ func (c *Client) DeleteTopic(t string) error {
 
 func (c *Client) UpdateTopic(topic Topic) error {
 	broker, err := c.client.Controller()
-
 	if err != nil {
 		return err
 	}
@@ -146,9 +143,7 @@ func (c *Client) UpdateTopic(topic Topic) error {
 
 func (c *Client) CreateTopic(t Topic) error {
 	broker, err := c.client.Controller()
-
 	if err != nil {
-		log.Printf("[WARN] Could get an available broker %s", err)
 		return err
 	}
 
@@ -181,12 +176,10 @@ func (c *Client) CreateTopic(t Topic) error {
 func (c *Client) AddPartitions(t Topic) error {
 	broker, err := c.client.Controller()
 	if err != nil {
-		log.Printf("[ERROR] Unable to fetch controller: %s", err)
 		return err
 	}
 
 	timeout := time.Duration(c.config.Timeout) * time.Second
-
 	tp := map[string]*sarama.TopicPartition{
 		t.Name: &sarama.TopicPartition{
 			Count: t.Partitions,
@@ -220,6 +213,10 @@ func (client *Client) ReadTopic(name string) (Topic, error) {
 	}
 
 	err := c.RefreshMetadata()
+	if err != nil {
+		log.Printf("[ERROR] Error refreshing metadata %s", err)
+		return topic, err
+	}
 	topics, err := c.Topics()
 
 	if err != nil {
@@ -227,10 +224,11 @@ func (client *Client) ReadTopic(name string) (Topic, error) {
 		return topic, err
 	}
 
+	log.Printf("[INFO] There are %d topics", len(topics))
 	for _, t := range topics {
 		log.Printf("[DEBUG] Reading Topic %s from Kafka", t)
 		if name == t {
-			log.Printf("[DEBUG] FOUND %s from Kafka", t)
+			log.Printf("[DEBUG] Found %s from Kafka", t)
 			p, err := c.Partitions(t)
 			if err == nil {
 				partitionCount := int32(len(p))
@@ -255,12 +253,9 @@ func (client *Client) ReadTopic(name string) (Topic, error) {
 			}
 		}
 	}
+
 	err = TopicMissingError{msg: fmt.Sprintf("%s could not be found", name)}
 	return topic, err
-}
-
-func (c *Client) getDescribeConfigAPIVersion() int16 {
-	return int16(c.versionForKey(32, 1))
 }
 
 func (c *Client) versionForKey(apiKey, wantedMaxVersion int) int {
@@ -274,103 +269,7 @@ func (c *Client) versionForKey(apiKey, wantedMaxVersion int) int {
 	return 0
 }
 
-func (c *Client) CreateACL(s StringlyTypedACL) error {
-	broker, err := c.availableBroker()
-	if err != nil {
-		return err
-	}
-
-	ac, err := s.AclCreation()
-	if err != nil {
-		return err
-	}
-	req := &sarama.CreateAclsRequest{
-		Version:      c.aclVersion(),
-		AclCreations: []*sarama.AclCreation{ac},
-	}
-
-	res, err := broker.CreateAcls(req)
-	if err != nil {
-		return err
-	}
-
-	for _, r := range res.AclCreationResponses {
-		if r.Err != sarama.ErrNoError {
-			return r.Err
-		}
-	}
-
-	return nil
-}
-
-func (c *Client) ListACLs() ([]*sarama.ResourceAcls, error) {
-	broker, err := c.availableBroker()
-	if err != nil {
-		return nil, err
-	}
-	err = c.client.RefreshMetadata()
-	if err != nil {
-		return nil, err
-	}
-	allResources := []*sarama.DescribeAclsRequest{
-		&sarama.DescribeAclsRequest{
-			Version: c.aclVersion(),
-			AclFilter: sarama.AclFilter{
-				ResourceType:              sarama.AclResourceTopic,
-				ResourcePatternTypeFilter: sarama.AclPatternAny,
-				PermissionType:            sarama.AclPermissionAny,
-				Operation:                 sarama.AclOperationAny,
-			},
-		},
-		&sarama.DescribeAclsRequest{
-			Version: c.aclVersion(),
-			AclFilter: sarama.AclFilter{
-				ResourceType:              sarama.AclResourceGroup,
-				ResourcePatternTypeFilter: sarama.AclPatternAny,
-				PermissionType:            sarama.AclPermissionAny,
-				Operation:                 sarama.AclOperationAny,
-			},
-		},
-		&sarama.DescribeAclsRequest{
-			Version: c.aclVersion(),
-			AclFilter: sarama.AclFilter{
-				ResourceType:              sarama.AclResourceCluster,
-				ResourcePatternTypeFilter: sarama.AclPatternAny,
-				PermissionType:            sarama.AclPermissionAny,
-				Operation:                 sarama.AclOperationAny,
-			},
-		},
-		&sarama.DescribeAclsRequest{
-			Version: c.aclVersion(),
-			AclFilter: sarama.AclFilter{
-				ResourceType:              sarama.AclResourceTransactionalID,
-				ResourcePatternTypeFilter: sarama.AclPatternAny,
-				PermissionType:            sarama.AclPermissionAny,
-				Operation:                 sarama.AclOperationAny,
-			},
-		},
-	}
-	res := []*sarama.ResourceAcls{}
-
-	for _, r := range allResources {
-		aclsR, err := broker.DescribeAcls(r)
-		if err != nil {
-			return nil, err
-		}
-
-		if err == nil {
-			if aclsR.Err != sarama.ErrNoError {
-				return nil, fmt.Errorf("%s", aclsR.Err)
-			}
-		}
-
-		for _, a := range aclsR.ResourceAcls {
-			res = append(res, a)
-		}
-	}
-	return res, err
-}
-
+//topicConfig retrives the non-default config map for a topic
 func (c *Client) topicConfig(topic string) (map[string]*string, error) {
 	conf := map[string]*string{}
 	request := &sarama.DescribeConfigsRequest{
@@ -410,30 +309,17 @@ func (c *Client) topicConfig(topic string) (map[string]*string, error) {
 	return conf, nil
 }
 
-func (c *Client) availableBroker() (*sarama.Broker, error) {
-	var err error
-	brokers := *c.config.BootstrapServers
-	kc := c.kafkaConfig
-
-	log.Printf("[DEBUG] Looking for Brokers @ %v", brokers)
-	for _, b := range brokers {
-		broker := sarama.NewBroker(b)
-		err = broker.Open(kc)
-		if err == nil {
-			return broker, nil
-		}
-		log.Printf("[WARN] Broker @ %s cannot be reached\n", b)
-	}
-
-	return nil, fmt.Errorf("No Available Brokers @ %v", brokers)
+func (c *Client) getDescribeAclsRequestAPIVersion() int16 {
+	return int16(c.versionForKey(29, 1))
+}
+func (c *Client) getCreateAclsRequestAPIVersion() int16 {
+	return int16(c.versionForKey(30, 1))
 }
 
-func (c *Client) aclVersion() int {
-	if c.kafkaConfig.Version.IsAtLeast(sarama.V2_0_0_0) {
-		log.Printf("[DEBUG] Using version 1 for ACL requests; %s", c.kafkaConfig.Version)
-		return 1
-	}
-	log.Printf("[DEBUG] Using version 0 for ACL requests; %s", c.kafkaConfig.Version)
+func (c *Client) getDeleteAclsRequestAPIVersion() int16 {
+	return int16(c.versionForKey(31, 1))
+}
 
-	return 0
+func (c *Client) getDescribeConfigAPIVersion() int16 {
+	return int16(c.versionForKey(32, 1))
 }

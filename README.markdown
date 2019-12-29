@@ -59,3 +59,11 @@ Use this in combination with the vault pki backend.
       printf "%s" "$DATA" | jq -r .certificate > client.cert
       printf "%s" "$DATA" | jq -r .issuing_ca  > ca.cert
     ```
+# Developing
+
+dc up vault && ./kafka-helper-scripts/enable-pki &&  ./kafka-helper-scripts/generate-broker-keystore.sh &&  ./kafka-helper-scripts/generate-truststore.sh && bin/build-and-add-plugin && dc up
+0. `dc up vault`
+0. ./kafka-helper-scripts/enable-pki&&  ./kafka-helper-scripts/generate-broker-keystore.sh &&  ./kafka-helper-scripts/generate-truststore.sh
+0. bin/build-and-add-plugin
+0. dc up
+

@@ -1,1 +1,1 @@
-{ "acl": { "host": "*", "operation": "Read", "permission_type": "Allow" }, "resource": { "type": "Topic", "name": "my-topic", "pattern_type_filter": "literal" } }
+{ "acl": { "host": "*", "operation": "Read", "permission_type": "Allow" }, "resource": { "type": "Topic", "name": "my-topic", "pattern_type_filter": "Literal" } }

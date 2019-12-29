@@ -3,7 +3,11 @@ package kafka
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"io/ioutil"
+	"log"
+	"time"
 
 	"github.com/Shopify/sarama"
 )
@@ -11,35 +15,48 @@ import (
 type Config struct {
 	BootstrapServers *[]string
 	Timeout          int
-
-	CACert         *x509.Certificate
-	CACertFile     string
-	ClientCert     *tls.Certificate
-	ClientCertFile string
-	ClientCertKey  string
-	TLSEnabled     bool
-	SkipTLSVerify  bool
-	SASLUsername   string
-	SASLPassword   string
-}
-
-func (c *Config) saslEnabled() bool {
-	return c.SASLUsername != "" || c.SASLPassword != ""
+	CACert           string
+	ClientCert       string
+	ClientCertKey    string
+	TLSEnabled       bool
+	SkipTLSVerify    bool
+	SASLUsername     string
+	SASLPassword     string
+	SASLMechanism    string
 }
 
 func (c *Config) newKafkaConfig() (*sarama.Config, error) {
 	kafkaConfig := sarama.NewConfig()
 	kafkaConfig.Version = sarama.V2_1_0_0
 	kafkaConfig.ClientID = "terraform-provider-kafka"
+	kafkaConfig.Admin.Timeout = time.Duration(c.Timeout) * time.Second
 
 	if c.saslEnabled() {
+		switch c.SASLMechanism {
+		case "scram-sha512":
+			kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+			kafkaConfig.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA512)
+		case "scram-sha256":
+			kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA256} }
+			kafkaConfig.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA256)
+		case "plain":
+		default:
+			log.Fatalf("[ERROR] Invalid sasl mechanism \"%s\": can only be \"scram-sha256\", \"scram-sha512\" or \"plain\"", c.SASLMechanism)
+		}
 		kafkaConfig.Net.SASL.Enable = true
 		kafkaConfig.Net.SASL.Password = c.SASLPassword
 		kafkaConfig.Net.SASL.User = c.SASLUsername
+		kafkaConfig.Net.SASL.Handshake = true
+	} else {
+		log.Println("[WARN] No SASL for you")
 	}
 
 	if c.TLSEnabled {
-		tlsConfig, err := c.newTLSConfig()
+		tlsConfig, err := newTLSConfig(
+			c.ClientCert,
+			c.ClientCertKey,
+			c.CACert)
+
 		if err != nil {
 			return kafkaConfig, err
 		}
@@ -52,55 +69,63 @@ func (c *Config) newKafkaConfig() (*sarama.Config, error) {
 	return kafkaConfig, nil
 }
 
-func (c *Config) newTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{}
+func (c *Config) saslEnabled() bool {
+	return c.SASLUsername != "" || c.SASLPassword != ""
+}
 
-	cert, err := c.clientCert()
-	if err != nil {
-		return tlsConfig, err
-	}
-	if cert != nil {
-		tlsConfig.Certificates = []tls.Certificate{*cert}
+func NewTLSConfig(clientCert, clientKey, caCert string) (*tls.Config, error) {
+	return newTLSConfig(clientCert, clientKey, caCert)
+}
+
+func newTLSConfig(clientCert, clientKey, caCert string) (*tls.Config, error) {
+	tlsConfig := tls.Config{}
+
+	// Load client cert
+	if clientCert != "" && clientKey != "" {
+		cert, err := tls.X509KeyPair([]byte(clientCert), []byte(clientKey))
+		if err != nil {
+			// try from file
+			cert, err = tls.LoadX509KeyPair(clientCert, clientKey)
+			if err != nil {
+				log.Printf("[ERROR] Error creating client pair \ncert:\n%s\n key\n%s\n", clientCert, clientKey)
+				return &tlsConfig, err
+			}
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	} else {
+		log.Println("[WARN] skipping TLS client config")
 	}
 
-	pool, err := c.caCertPool()
-	if err != nil {
-		return tlsConfig, err
-	}
-	if pool != nil {
-		tlsConfig.RootCAs = pool
+	if caCert == "" {
+		log.Println("[WARN] no CA file set skipping")
+		return &tlsConfig, nil
 	}
 
+	caCertPool, _ := x509.SystemCertPool()
+	if caCertPool == nil {
+		caCertPool = x509.NewCertPool()
+	}
+	caPEM, _ := pem.Decode([]byte(caCert))
+	log.Println("[INFO] adding rootybou")
+	if caPEM == nil {
+		log.Println("[WARN] no caPem, checking from file")
+		// try as file
+		caCert, err := ioutil.ReadFile(caCert)
+		if err != nil {
+			log.Println("[ERROR] unable to read CA")
+			return &tlsConfig, err
+		}
+		log.Println("[WARN] Adding pem from file")
+		caCertPool.AppendCertsFromPEM(caCert)
+	} else {
+		ok := caCertPool.AppendCertsFromPEM([]byte(caCert))
+		fmt.Printf("set cert pool %v", ok)
+		if !ok {
+			return &tlsConfig, fmt.Errorf("Couldn't add the caPem")
+		}
+	}
+
+	tlsConfig.RootCAs = caCertPool
 	tlsConfig.BuildNameToCertificate()
-
-	return tlsConfig, nil
-}
-
-func (c *Config) clientCert() (*tls.Certificate, error) {
-	if c.ClientCert != nil {
-		return c.ClientCert, nil
-	}
-	if c.ClientCertFile != "" && c.ClientCertKey != "" {
-		cert, err := tls.LoadX509KeyPair(c.ClientCertFile, c.ClientCertKey)
-		if err != nil {
-			return nil, err
-		}
-		return &cert, nil
-	}
-
-	return nil, nil
-}
-
-func (c *Config) caCertPool() (*x509.CertPool, error) {
-	pool := x509.NewCertPool()
-	if c.CACert != nil {
-		pool.AddCert(c.CACert)
-	} else if c.CACertFile == "" {
-		caCert, err := ioutil.ReadFile(c.CACertFile)
-		if err != nil {
-			return nil, err
-		}
-		pool.AppendCertsFromPEM(caCert)
-	}
-	return pool, nil
+	return &tlsConfig, nil
 }

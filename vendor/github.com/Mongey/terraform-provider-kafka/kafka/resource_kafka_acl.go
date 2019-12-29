@@ -3,7 +3,7 @@ package kafka
 import (
 	"log"
 
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
 func kafkaACLResource() *schema.Resource {
@@ -14,6 +14,8 @@ func kafkaACLResource() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			State: schema.ImportStatePassthrough,
 		},
+		SchemaVersion: 1,
+		MigrateState:  migrateKafkaAclState,
 		Schema: map[string]*schema.Schema{
 			"resource_name": {
 				Type:        schema.TypeString,
@@ -59,7 +61,7 @@ func kafkaACLResource() *schema.Resource {
 
 func aclCreate(d *schema.ResourceData, meta interface{}) error {
 	c := meta.(*Client)
-	a := TerraformToACL(d)
+	a := aclInfo(d)
 
 	log.Printf("[INFO] Creating ACL %s", a)
 	err := c.CreateACL(a)
@@ -76,14 +78,16 @@ func aclCreate(d *schema.ResourceData, meta interface{}) error {
 
 func aclDelete(d *schema.ResourceData, meta interface{}) error {
 	c := meta.(*Client)
-	a := TerraformToACL(d)
-	log.Printf("[INFO] Deleteing ACL %s", a)
+	a := aclInfo(d)
+	log.Printf("[INFO] Deleting ACL %s", a)
 	return c.DeleteACL(a)
 }
 
 func aclRead(d *schema.ResourceData, meta interface{}) error {
+	log.Println("[INFO] Reading ACL")
 	c := meta.(*Client)
-	a := TerraformToACL(d)
+	a := aclInfo(d)
+	log.Printf("[INFO] Reading ACL %s", a)
 
 	currentAcls, err := c.ListACLs()
 	if err != nil {
@@ -91,6 +95,7 @@ func aclRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	for _, c := range currentAcls {
 		if c.ResourceName == a.Resource.Name {
+			log.Printf("[INFO] Found ACL %v", c)
 			return nil
 		}
 
@@ -98,8 +103,7 @@ func aclRead(d *schema.ResourceData, meta interface{}) error {
 	return nil
 }
 
-// TerraformToACL returns a ACL from a terraform block
-func TerraformToACL(d *schema.ResourceData) StringlyTypedACL {
+func aclInfo(d *schema.ResourceData) StringlyTypedACL {
 	s := StringlyTypedACL{
 		ACL: ACL{
 			Principal:      d.Get("acl_principal").(string),

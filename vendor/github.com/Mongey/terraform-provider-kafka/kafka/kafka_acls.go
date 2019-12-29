@@ -22,44 +22,29 @@ type Resource struct {
 }
 
 type StringlyTypedACL struct {
-	ACL      ACL      `json:"acl"`
-	Resource Resource `json:"resource"`
+	ACL      ACL `json:"acl"`
+	Resource `json:"resource"`
 }
 
 func (a StringlyTypedACL) String() string {
 	return strings.Join([]string{a.ACL.Principal, a.ACL.Host, a.ACL.Operation, a.ACL.PermissionType, a.Resource.Type, a.Resource.Name, a.Resource.PatternTypeFilter}, "|")
 }
 
-func stringToACLPrefix(s string) sarama.AclResourcePatternType {
-	switch s {
-	case "Any":
-		return sarama.AclPatternAny
-	case "Match":
-		return sarama.AclPatternMatch
-	case "Literal":
-		return sarama.AclPatternLiteral
-	case "Prefixed":
-		return sarama.AclPatternPrefixed
-	}
-	return unknownConversion
-}
-
-func (s StringlyTypedACL) AclCreation() (*sarama.AclCreation, error) {
+func tfToAclCreation(s StringlyTypedACL) (*sarama.AclCreation, error) {
 	acl := &sarama.AclCreation{}
 
 	op := stringToOperation(s.ACL.Operation)
 	if op == unknownConversion {
-		return acl, fmt.Errorf("Unknown operation: '%s'", s.ACL.Operation)
+		return acl, fmt.Errorf("Unknown operation: %s", s.ACL.Operation)
 	}
-	permissionType := stringToAclPermissionType(s.ACL.PermissionType)
-	if permissionType == unknownConversion {
-		return acl, fmt.Errorf("Unknown permission type: '%s'", s.ACL.PermissionType)
+	pType := stringToAclPermissionType(s.ACL.PermissionType)
+	if pType == unknownConversion {
+		return acl, fmt.Errorf("Unknown permission type: %s", s.ACL.PermissionType)
 	}
 	rType := stringToACLResouce(s.Resource.Type)
 	if rType == unknownConversion {
-		return acl, fmt.Errorf("Unknown resource type: '%s'", s.Resource.Type)
+		return acl, fmt.Errorf("Unknown resource type: %s", s.Resource.Type)
 	}
-
 	patternType := stringToACLPrefix(s.Resource.PatternTypeFilter)
 	if patternType == unknownConversion {
 		return acl, fmt.Errorf("Unknown pattern type filter: '%s'", s.Resource.PatternTypeFilter)
@@ -69,12 +54,12 @@ func (s StringlyTypedACL) AclCreation() (*sarama.AclCreation, error) {
 		Principal:      s.ACL.Principal,
 		Host:           s.ACL.Host,
 		Operation:      op,
-		PermissionType: permissionType,
+		PermissionType: pType,
 	}
 	acl.Resource = sarama.Resource{
-		ResourceType:       rType,
-		ResourceName:       s.Resource.Name,
-		ResoucePatternType: patternType,
+		ResourceType:        rType,
+		ResourceName:        s.Resource.Name,
+		ResourcePatternType: patternType,
 	}
 
 	return acl, nil
@@ -82,7 +67,7 @@ func (s StringlyTypedACL) AclCreation() (*sarama.AclCreation, error) {
 
 const unknownConversion = -1
 
-func (s StringlyTypedACL) AclFilter() (sarama.AclFilter, error) {
+func tfToAclFilter(s StringlyTypedACL) (sarama.AclFilter, error) {
 	f := sarama.AclFilter{
 		Principal:    &s.ACL.Principal,
 		Host:         &s.ACL.Host,
@@ -116,12 +101,26 @@ func (s StringlyTypedACL) AclFilter() (sarama.AclFilter, error) {
 	return f, nil
 }
 
+func stringToACLPrefix(s string) sarama.AclResourcePatternType {
+	switch s {
+	case "Any":
+		return sarama.AclPatternAny
+	case "Match":
+		return sarama.AclPatternMatch
+	case "Literal":
+		return sarama.AclPatternLiteral
+	case "Prefixed":
+		return sarama.AclPatternPrefixed
+	}
+	return unknownConversion
+}
+
 func (c *Client) DeleteACL(s StringlyTypedACL) error {
-	broker, err := c.availableBroker()
+	log.Printf("[INFO] Deleting ACL %v", s)
+	broker, err := c.client.Controller()
 	if err != nil {
 		return err
 	}
-
 	aclsBeforeDelete, err := c.ListACLs()
 	if err != nil {
 		return fmt.Errorf("Unable to list acls before deleting -- can't be sure we're doing the right thing: %s", err)
@@ -132,17 +131,15 @@ func (c *Client) DeleteACL(s StringlyTypedACL) error {
 		log.Printf("[DEBUG] ACL: %v", acl)
 	}
 
-	filter, err := s.AclFilter()
+	filter, err := tfToAclFilter(s)
 	if err != nil {
 		return err
 	}
 
 	req := &sarama.DeleteAclsRequest{
-		Version: c.aclVersion(),
+		Version: int(c.getDeleteAclsRequestAPIVersion()),
 		Filters: []*sarama.AclFilter{&filter},
 	}
-
-	log.Printf("[INFO] Deleting ACL %v\n", s)
 
 	res, err := broker.DeleteAcls(req)
 	if err != nil {
@@ -150,8 +147,8 @@ func (c *Client) DeleteACL(s StringlyTypedACL) error {
 	}
 
 	matchingAclCount := 0
+
 	for _, r := range res.FilterResponses {
-		log.Printf("Got %d matching Acls", len(r.MatchingAcls))
 		matchingAclCount += len(r.MatchingAcls)
 		if r.Err != sarama.ErrNoError {
 			return r.Err
@@ -161,6 +158,45 @@ func (c *Client) DeleteACL(s StringlyTypedACL) error {
 	if matchingAclCount == 0 {
 		return fmt.Errorf("There were no acls matching this filter")
 	}
+	return nil
+}
+
+func (c *Client) CreateACL(s StringlyTypedACL) error {
+	log.Printf("[DEBUG] Creating ACL %s", s)
+	broker, err := c.client.Controller()
+	if err != nil {
+		err2 := c.client.RefreshMetadata()
+		log.Printf("[DEBUG] Creating ACL err %s", err)
+		log.Printf("[DEBUG] Creating ACL err2 %s , %v", err2, c.client.Config().Admin.Timeout)
+		_, err3 := c.client.Controller()
+		brokers := c.client.Brokers()
+		log.Printf("[DEBUG] Creating ACL err3 %s , closed? %v", err3, brokers)
+		if len(brokers) < 1 {
+			return err
+		}
+		broker = brokers[0]
+	}
+
+	ac, err := tfToAclCreation(s)
+	if err != nil {
+		return err
+	}
+	req := &sarama.CreateAclsRequest{
+		Version:      c.getCreateAclsRequestAPIVersion(),
+		AclCreations: []*sarama.AclCreation{ac},
+	}
+
+	res, err := broker.CreateAcls(req)
+	if err != nil {
+		return err
+	}
+
+	for _, r := range res.AclCreationResponses {
+		if r.Err != sarama.ErrNoError {
+			return r.Err
+		}
+	}
+	log.Printf("[DEBUG] Created ACL %s", s)
 
 	return nil
 }
@@ -227,4 +263,74 @@ func stringToAclPermissionType(in string) sarama.AclPermissionType {
 		return sarama.AclPermissionAllow
 	}
 	return unknownConversion
+}
+
+func (c *Client) ListACLs() ([]*sarama.ResourceAcls, error) {
+	log.Printf("[INFO] Listing all ACLS")
+	broker, err := c.client.Controller()
+	if err != nil {
+		return nil, err
+	}
+	err = c.client.RefreshMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	allResources := []*sarama.DescribeAclsRequest{
+		&sarama.DescribeAclsRequest{
+			Version: int(c.getDescribeAclsRequestAPIVersion()),
+			AclFilter: sarama.AclFilter{
+				ResourceType:              sarama.AclResourceTopic,
+				ResourcePatternTypeFilter: sarama.AclPatternAny,
+				PermissionType:            sarama.AclPermissionAny,
+				Operation:                 sarama.AclOperationAny,
+			},
+		},
+		&sarama.DescribeAclsRequest{
+			Version: int(c.getDescribeAclsRequestAPIVersion()),
+			AclFilter: sarama.AclFilter{
+				ResourceType:              sarama.AclResourceGroup,
+				ResourcePatternTypeFilter: sarama.AclPatternAny,
+				PermissionType:            sarama.AclPermissionAny,
+				Operation:                 sarama.AclOperationAny,
+			},
+		},
+		&sarama.DescribeAclsRequest{
+			Version: int(c.getDescribeAclsRequestAPIVersion()),
+			AclFilter: sarama.AclFilter{
+				ResourceType:              sarama.AclResourceCluster,
+				ResourcePatternTypeFilter: sarama.AclPatternAny,
+				PermissionType:            sarama.AclPermissionAny,
+				Operation:                 sarama.AclOperationAny,
+			},
+		},
+		&sarama.DescribeAclsRequest{
+			Version: int(c.getDescribeAclsRequestAPIVersion()),
+			AclFilter: sarama.AclFilter{
+				ResourceType:              sarama.AclResourceTransactionalID,
+				ResourcePatternTypeFilter: sarama.AclPatternAny,
+				PermissionType:            sarama.AclPermissionAny,
+				Operation:                 sarama.AclOperationAny,
+			},
+		},
+	}
+	res := []*sarama.ResourceAcls{}
+
+	for _, r := range allResources {
+		aclsR, err := broker.DescribeAcls(r)
+		if err != nil {
+			return nil, err
+		}
+
+		if err == nil {
+			if aclsR.Err != sarama.ErrNoError {
+				return nil, fmt.Errorf("%s", aclsR.Err)
+			}
+		}
+
+		for _, a := range aclsR.ResourceAcls {
+			res = append(res, a)
+		}
+	}
+	return res, err
 }

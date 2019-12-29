@@ -5,9 +5,11 @@ services:
     image: vault:1.3.0
     ports:
       - "8200:8200"
-    command: vault server -dev -config="/vault/vault.hcl"
+    command: vault server -dev -config="/vault/vault.hcl" -log-level="debug"
     volumes:
       - ./docker:/vault
+    links:
+      - kafka:kafka
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: "root"
       VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
@@ -31,7 +33,6 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: SSL://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
       KAFKA_SSL_KEYSTORE_FILENAME: kafka.broker0.keystore.jks
@@ -46,8 +47,10 @@ services:
       KAFKA_SSL_CLIENT_AUTH: required
       KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
       KAFKA_LISTENER_NAME_INTERNAL_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: 
-      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
       KAFKA_AUTHORIZER_CLASS_NAME: kafka.security.auth.SimpleAclAuthorizer
+      # TODO: change this
+      KAFKA_ADVERTISED_LISTENERS: SSL://192.168.0.248:9092
     volumes:
       - ./tmp/secrets:/etc/kafka/secrets
     extra_hosts:

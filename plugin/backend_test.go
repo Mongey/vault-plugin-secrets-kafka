@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/hashicorp/vault/logical"
-	logicaltest "github.com/hashicorp/vault/logical/testing"
+	logicaltest "github.com/hashicorp/vault/helper/testhelpers/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func TestSomething(t *testing.T) {
