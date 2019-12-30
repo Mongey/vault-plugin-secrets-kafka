@@ -1,9 +1,9 @@
-version: 2
+version: 2.1
 jobs:
   build:
     working_directory: /go/src/github.com/Mongey/vault-plugin-secrets-kafka
     docker:
-      - image: circleci/golang:1.11
+      - image: circleci/golang:1.13
         environment:
           TEST_RESULTS: /tmp/test-results
     steps:
@@ -15,14 +15,14 @@ jobs:
   test:
     working_directory: /go/src/github.com/Mongey/vault-plugin-secrets-kafka
     docker:
-      - image: circleci/golang:1.11
+      - image: circleci/golang:1.13
         environment:
           TEST_RESULTS: /tmp/test-results
       - image: confluentinc/cp-zookeeper:latest
         environment:
           ZOOKEEPER_CLIENT_PORT: 2181
           ZOOKEEPER_TICK_TIME: 2000
-      - image: mongey/kafka:5.0.1
+      - image: mongey/kafka:5.0.1-new-certs
         environment:
           KAFKA_BROKER_ID: 1
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
