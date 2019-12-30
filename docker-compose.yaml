@@ -50,7 +50,7 @@ services:
       KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
       KAFKA_AUTHORIZER_CLASS_NAME: kafka.security.auth.SimpleAclAuthorizer
       # TODO: change this
-      KAFKA_ADVERTISED_LISTENERS: SSL://192.168.0.248:9092
+      KAFKA_ADVERTISED_LISTENERS: SSL://kafka:9092
     volumes:
       - ./tmp/secrets:/etc/kafka/secrets
     extra_hosts:
