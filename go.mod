@@ -6,7 +6,7 @@ replace github.com/Mongey/terraform-provider-kafka v0.2.3 => ../terraform-provid
 
 require (
 	github.com/Microsoft/go-winio v0.4.14 // indirect
-	github.com/Mongey/terraform-provider-kafka v0.2.3
+	github.com/Mongey/terraform-provider-kafka v0.2.3-0.20191229235334-7090c7cff2aa
 	github.com/Shopify/sarama v1.24.1
 	github.com/asaskevich/govalidator v0.0.0-20190424111038-f61b66f89f4a // indirect
 	github.com/containerd/continuity v0.0.0-20191214063359-1097c8bae83b // indirect

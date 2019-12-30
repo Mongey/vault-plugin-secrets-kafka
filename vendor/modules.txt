@@ -8,7 +8,7 @@ cloud.google.com/go/internal/version
 cloud.google.com/go/storage
 # github.com/Jeffail/gabs/v2 v2.1.0
 github.com/Jeffail/gabs/v2
-# github.com/Mongey/terraform-provider-kafka v0.2.3 => ../terraform-provider-kafka/
+# github.com/Mongey/terraform-provider-kafka v0.2.3-0.20191229235334-7090c7cff2aa
 github.com/Mongey/terraform-provider-kafka/kafka
 # github.com/NYTimes/gziphandler v1.1.1
 github.com/NYTimes/gziphandler
