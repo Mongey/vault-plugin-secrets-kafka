@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/Mongey/terraform-provider-kafka/kafka"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathListRoles(b *backend) *framework.Path {

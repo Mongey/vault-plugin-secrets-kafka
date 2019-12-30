@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathConfigAccess() *framework.Path {
@@ -31,13 +31,12 @@ func pathConfigAccess() *framework.Path {
 				Description: "The key for the client certificate",
 			},
 			"tls_enabled": &framework.FieldSchema{
-				Type:        framework.TypeString,
+				Type:        framework.TypeBool,
 				Description: "Enable TLS for communication with the broker",
 				Default:     true,
-				//Optional:    true,
 			},
 			"skip_tls_verify": &framework.FieldSchema{
-				Type:        framework.TypeString,
+				Type:        framework.TypeBool,
 				Description: "Skip verification of the connection with the broker",
 				Default:     false,
 				//Optional:    true,

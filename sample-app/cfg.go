@@ -30,7 +30,11 @@ func newTLSConfig(clientCertFile, clientKeyFile, caCertFile string) (*tls.Config
 	if err != nil {
 		return &tlsConfig, err
 	}
-	caCertPool := x509.NewCertPool()
+	caCertPool, _ := x509.SystemCertPool()
+	if caCertPool == nil {
+		caCertPool = x509.NewCertPool()
+	}
+
 	caCertPool.AppendCertsFromPEM(caCert)
 	tlsConfig.RootCAs = caCertPool
 	tlsConfig.BuildNameToCertificate()

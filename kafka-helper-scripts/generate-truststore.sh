@@ -23,4 +23,5 @@ echo "Cleaning up"
 set +e
 rm issuing_ca.cer
 set -e
-
+echo $PASSWORD > tmp/secrets/broker0_truststore_creds
+mv $OUTPUT_FILE tmp/secrets/kafka.broker0.truststore.jks

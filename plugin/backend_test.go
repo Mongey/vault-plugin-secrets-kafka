@@ -2,12 +2,13 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"testing"
 
-	"github.com/hashicorp/vault/logical"
-	logicaltest "github.com/hashicorp/vault/logical/testing"
+	logicaltest "github.com/hashicorp/vault/helper/testhelpers/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func TestSomething(t *testing.T) {
@@ -15,8 +16,8 @@ func TestSomething(t *testing.T) {
 	uri := "localhost:9092"
 
 	logicaltest.Test(t, logicaltest.TestCase{
-		PreCheck: testAccPreCheckFunc(t, uri),
-		Backend:  b,
+		PreCheck:       testAccPreCheckFunc(t, uri),
+		LogicalBackend: b,
 		Steps: []logicaltest.TestStep{
 			testAccStepConfig(t, uri),
 			testAccStepRole(t, "readall"),
@@ -34,8 +35,14 @@ func testAccStepRole(t *testing.T, role string) logicaltest.TestStep {
 		},
 	}
 }
+
 func testAccStepConfig(t *testing.T, uri string) logicaltest.TestStep {
 	password := os.Getenv("KAFKA_ROOT_CERTIFICATE")
+	if password == "" {
+		t.Fatal("KAFKA_ROOT_CERTIFICATE must be set in the env")
+	}
+	sDec, _ := base64.StdEncoding.DecodeString(password)
+	password = string(sDec)
 
 	return logicaltest.TestStep{
 		Operation: logical.UpdateOperation,

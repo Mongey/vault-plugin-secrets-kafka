@@ -2,15 +2,13 @@ package plugin
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"log"
 
 	"github.com/Mongey/terraform-provider-kafka/kafka"
-	"github.com/hashicorp/errwrap"
-	"github.com/hashicorp/vault/logical"
+	"github.com/Shopify/sarama"
+	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 type accessConfig struct {
@@ -22,11 +20,9 @@ type accessConfig struct {
 	SkipTLSVerify bool   `json:"skip_tls_verify"`
 }
 
-func (a *accessConfig) cert() (tls.Certificate, error) {
-	return tls.X509KeyPair([]byte(a.ClientCert), []byte(a.ClientKey))
-}
-
 func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error) {
+	logger := hclog.New(&hclog.LoggerOptions{})
+	sarama.Logger = log.New(logger.StandardWriter(&hclog.StandardLoggerOptions{InferLevels: true, ForceLevel: hclog.Trace}), "[DEBUG] [Sarama]", log.LstdFlags)
 	conf, userErr, intErr := readConfigAccess(ctx, s)
 	if intErr != nil {
 		return nil, nil, intErr
@@ -42,28 +38,13 @@ func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error
 		BootstrapServers: &[]string{conf.Address},
 		TLSEnabled:       conf.TLSEnabled,
 		SkipTLSVerify:    conf.SkipTLSVerify,
+		ClientCert:       conf.ClientCert,
+		ClientCertKey:    conf.ClientKey,
+		CACert:           conf.CACert,
+		Timeout:          300,
 	}
 
-	log.Printf("[DEBUG] Client certicate being loaded")
-	cert, err := conf.cert()
-	if err == nil {
-		kafkaConfig.ClientCert = &cert
-	} else {
-		return nil, err, nil
-	}
-
-	log.Printf("[DEBUG] CA certicate being loaded")
-	block, _ := pem.Decode([]byte(conf.CACert))
-	var cacert *x509.Certificate
-	cacert, err = x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, err, nil
-	}
-	if cacert != nil {
-		kafkaConfig.CACert = cacert
-	}
-
-	log.Printf("[DEBUG] Creating Client")
+	log.Printf("[DEBUG] Creating Client %s", conf.Address)
 	c, err := kafka.NewClient(kafkaConfig)
 	return c, nil, err
 }
@@ -80,7 +61,7 @@ func readConfigAccess(ctx context.Context, storage logical.Storage) (*accessConf
 
 	conf := &accessConfig{}
 	if err := entry.DecodeJSON(conf); err != nil {
-		return nil, nil, errwrap.Wrapf("error reading consul access configuration: {{err}}", err)
+		return nil, nil, fmt.Errorf("error reading consul access configuration: %s", err)
 	}
 
 	return conf, nil, nil

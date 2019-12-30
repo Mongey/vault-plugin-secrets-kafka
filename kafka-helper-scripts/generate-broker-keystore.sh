@@ -1,4 +1,6 @@
+#!/bin/bash
 set -e
+
 export VAULT_ADDR=http://localhost:8200
 
 TTL=1000
@@ -47,5 +49,8 @@ keytool -importkeystore \
         -alias $BROKER_NAME
 
 rm ca.crt server.key server.crt server.p12
+
+echo $PASSWORD > tmp/secrets/broker0_keystore_creds
+mv $OUTPUT_FILE tmp/secrets/kafka.broker0.keystore.jks
 
 echo "Done!"

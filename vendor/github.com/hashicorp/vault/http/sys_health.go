@@ -8,9 +8,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/hashicorp/vault/helper/consts"
+	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/vault/sdk/helper/consts"
+	"github.com/hashicorp/vault/sdk/helper/parseutil"
+	"github.com/hashicorp/vault/sdk/version"
 	"github.com/hashicorp/vault/vault"
-	"github.com/hashicorp/vault/version"
 )
 
 func handleSysHealth(core *vault.Core) http.Handler {
@@ -43,7 +45,7 @@ func handleSysHealthGet(core *vault.Core, w http.ResponseWriter, r *http.Request
 	code, body, err := getSysHealth(core, r)
 	if err != nil {
 		core.Logger().Error("error checking health", "error", err)
-		respondError(w, http.StatusInternalServerError, nil)
+		respondError(w, code, nil)
 		return
 	}
 
@@ -61,10 +63,7 @@ func handleSysHealthGet(core *vault.Core, w http.ResponseWriter, r *http.Request
 }
 
 func handleSysHealthHead(core *vault.Core, w http.ResponseWriter, r *http.Request) {
-	code, body, err := getSysHealth(core, r)
-	if err != nil {
-		code = http.StatusInternalServerError
-	}
+	code, body, _ := getSysHealth(core, r)
 
 	if body != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -73,8 +72,23 @@ func handleSysHealthHead(core *vault.Core, w http.ResponseWriter, r *http.Reques
 }
 
 func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, error) {
+	var err error
+
 	// Check if being a standby is allowed for the purpose of a 200 OK
-	_, standbyOK := r.URL.Query()["standbyok"]
+	standbyOKStr, standbyOK := r.URL.Query()["standbyok"]
+	if standbyOK {
+		standbyOK, err = parseutil.ParseBool(standbyOKStr[0])
+		if err != nil {
+			return http.StatusBadRequest, nil, errwrap.Wrapf("bad value for standbyok parameter: {{err}}", err)
+		}
+	}
+	perfStandbyOKStr, perfStandbyOK := r.URL.Query()["perfstandbyok"]
+	if perfStandbyOK {
+		perfStandbyOK, err = parseutil.ParseBool(perfStandbyOKStr[0])
+		if err != nil {
+			return http.StatusBadRequest, nil, errwrap.Wrapf("bad value for perfstandbyok parameter: {{err}}", err)
+		}
+	}
 
 	uninitCode := http.StatusNotImplemented
 	if code, found, ok := fetchStatusCode(r, "uninitcode"); !ok {
@@ -111,11 +125,19 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		drSecondaryCode = code
 	}
 
+	perfStandbyCode := 473 // unofficial 4xx status code
+	if code, found, ok := fetchStatusCode(r, "performancestandbycode"); !ok {
+		return http.StatusBadRequest, nil, nil
+	} else if found {
+		perfStandbyCode = code
+	}
+
 	ctx := context.Background()
 
 	// Check system status
 	sealed := core.Sealed()
 	standby, _ := core.Standby()
+	perfStandby := core.PerfStandby()
 	var replicationState consts.ReplicationState
 	if standby {
 		replicationState = core.ActiveNodeReplicationState()
@@ -137,8 +159,14 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		code = sealedCode
 	case replicationState.HasState(consts.ReplicationDRSecondary):
 		code = drSecondaryCode
-	case !standbyOK && standby:
-		code = standbyCode
+	case perfStandby:
+		if !perfStandbyOK {
+			code = perfStandbyCode
+		}
+	case standby:
+		if !standbyOK {
+			code = standbyCode
+		}
 	}
 
 	// Fetch the local cluster name and identifier
@@ -160,6 +188,7 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		Initialized:                init,
 		Sealed:                     sealed,
 		Standby:                    standby,
+		PerformanceStandby:         perfStandby,
 		ReplicationPerformanceMode: replicationState.GetPerformanceString(),
 		ReplicationDRMode:          replicationState.GetDRString(),
 		ServerTimeUTC:              time.Now().UTC().Unix(),
@@ -167,6 +196,11 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		ClusterName:                clusterName,
 		ClusterID:                  clusterID,
 	}
+
+	if init && !sealed && !standby {
+		body.LastWAL = vault.LastWAL(core)
+	}
+
 	return code, body, nil
 }
 
@@ -174,10 +208,12 @@ type HealthResponse struct {
 	Initialized                bool   `json:"initialized"`
 	Sealed                     bool   `json:"sealed"`
 	Standby                    bool   `json:"standby"`
+	PerformanceStandby         bool   `json:"performance_standby"`
 	ReplicationPerformanceMode string `json:"replication_performance_mode"`
 	ReplicationDRMode          string `json:"replication_dr_mode"`
 	ServerTimeUTC              int64  `json:"server_time_utc"`
 	Version                    string `json:"version"`
 	ClusterName                string `json:"cluster_name,omitempty"`
 	ClusterID                  string `json:"cluster_id,omitempty"`
+	LastWAL                    uint64 `json:"last_wal,omitempty"`
 }

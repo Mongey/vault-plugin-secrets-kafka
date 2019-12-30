@@ -6,20 +6,56 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
+	"github.com/hashicorp/vault/vault/seal/shamir"
+
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
-	multierror "github.com/hashicorp/go-multierror"
-	uuid "github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/vault/audit"
-	"github.com/hashicorp/vault/helper/consts"
-	"github.com/hashicorp/vault/helper/jsonutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/physical"
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/physical/raft"
+	"github.com/hashicorp/vault/sdk/helper/certutil"
+	"github.com/hashicorp/vault/sdk/helper/consts"
+	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/oklog/run"
 )
+
+const (
+	// lockRetryInterval is the interval we re-attempt to acquire the
+	// HA lock if an error is encountered
+	lockRetryInterval = 10 * time.Second
+
+	// leaderCheckInterval is how often a standby checks for a new leader
+	leaderCheckInterval = 2500 * time.Millisecond
+
+	// keyRotateCheckInterval is how often a standby checks for a key
+	// rotation taking place.
+	keyRotateCheckInterval = 10 * time.Second
+
+	// leaderPrefixCleanDelay is how long to wait between deletions
+	// of orphaned leader keys, to prevent slamming the backend.
+	leaderPrefixCleanDelay = 200 * time.Millisecond
+)
+
+var (
+	// KeyRotateGracePeriod is how long we allow an upgrade path
+	// for standby instances before we delete the upgrade keys
+	KeyRotateGracePeriod = 2 * time.Minute
+
+	addEnterpriseHaActors func(*Core, *run.Group) chan func()            = addEnterpriseHaActorsNoop
+	interruptPerfStandby  func(chan func(), chan struct{}) chan struct{} = interruptPerfStandbyNoop
+)
+
+func addEnterpriseHaActorsNoop(*Core, *run.Group) chan func() { return nil }
+func interruptPerfStandbyNoop(chan func(), chan struct{}) chan struct{} {
+	return make(chan struct{})
+}
 
 // Standby checks if the Vault is in standby mode
 func (c *Core) Standby() (bool, error) {
@@ -27,6 +63,14 @@ func (c *Core) Standby() (bool, error) {
 	standby := c.standby
 	c.stateLock.RUnlock()
 	return standby, nil
+}
+
+// PerfStandby checks if the vault is a performance standby
+func (c *Core) PerfStandby() bool {
+	c.stateLock.RLock()
+	perfStandby := c.perfStandby
+	c.stateLock.RUnlock()
+	return perfStandby
 }
 
 // Leader is used to get the current active leader
@@ -47,11 +91,11 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 	// Check if we are the leader
 	if !c.standby {
 		c.stateLock.RUnlock()
-		return true, c.redirectAddr, c.clusterAddr, nil
+		return true, c.redirectAddr, c.ClusterAddr(), nil
 	}
 
 	// Initialize a lock
-	lock, err := c.ha.LockWith(coreLockPath, "read")
+	lock, err := c.ha.LockWith(CoreLockPath, "read")
 	if err != nil {
 		c.stateLock.RUnlock()
 		return false, "", "", err
@@ -68,28 +112,41 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 		return false, "", "", nil
 	}
 
-	c.clusterLeaderParamsLock.RLock()
-	localLeaderUUID := c.clusterLeaderUUID
-	localRedirAddr := c.clusterLeaderRedirectAddr
-	localClusterAddr := c.clusterLeaderClusterAddr
-	c.clusterLeaderParamsLock.RUnlock()
+	var localLeaderUUID, localRedirectAddr, localClusterAddr string
+	clusterLeaderParams := c.clusterLeaderParams.Load().(*ClusterLeaderParams)
+	if clusterLeaderParams != nil {
+		localLeaderUUID = clusterLeaderParams.LeaderUUID
+		localRedirectAddr = clusterLeaderParams.LeaderRedirectAddr
+		localClusterAddr = clusterLeaderParams.LeaderClusterAddr
+	}
 
 	// If the leader hasn't changed, return the cached value; nothing changes
 	// mid-leadership, and the barrier caches anyways
-	if leaderUUID == localLeaderUUID && localRedirAddr != "" {
+	if leaderUUID == localLeaderUUID && localRedirectAddr != "" {
 		c.stateLock.RUnlock()
-		return false, localRedirAddr, localClusterAddr, nil
+		return false, localRedirectAddr, localClusterAddr, nil
 	}
 
 	c.logger.Trace("found new active node information, refreshing")
 
 	defer c.stateLock.RUnlock()
-	c.clusterLeaderParamsLock.Lock()
-	defer c.clusterLeaderParamsLock.Unlock()
+	c.leaderParamsLock.Lock()
+	defer c.leaderParamsLock.Unlock()
 
 	// Validate base conditions again
-	if leaderUUID == c.clusterLeaderUUID && c.clusterLeaderRedirectAddr != "" {
-		return false, localRedirAddr, localClusterAddr, nil
+	clusterLeaderParams = c.clusterLeaderParams.Load().(*ClusterLeaderParams)
+	if clusterLeaderParams != nil {
+		localLeaderUUID = clusterLeaderParams.LeaderUUID
+		localRedirectAddr = clusterLeaderParams.LeaderRedirectAddr
+		localClusterAddr = clusterLeaderParams.LeaderClusterAddr
+	} else {
+		localLeaderUUID = ""
+		localRedirectAddr = ""
+		localClusterAddr = ""
+	}
+
+	if leaderUUID == localLeaderUUID && localRedirectAddr != "" {
+		return false, localRedirectAddr, localClusterAddr, nil
 	}
 
 	key := coreLeaderPrefix + leaderUUID
@@ -134,9 +191,11 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 
 	// Don't set these until everything has been parsed successfully or we'll
 	// never try again
-	c.clusterLeaderRedirectAddr = adv.RedirectAddr
-	c.clusterLeaderClusterAddr = adv.ClusterAddr
-	c.clusterLeaderUUID = leaderUUID
+	c.clusterLeaderParams.Store(&ClusterLeaderParams{
+		LeaderUUID:         leaderUUID,
+		LeaderRedirectAddr: adv.RedirectAddr,
+		LeaderClusterAddr:  adv.ClusterAddr,
+	})
 
 	return false, adv.RedirectAddr, adv.ClusterAddr, nil
 }
@@ -152,6 +211,7 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
+
 	if c.Sealed() {
 		return nil
 	}
@@ -159,7 +219,7 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(c.activeContext)
+	ctx, cancel := context.WithCancel(namespace.RootContext(nil))
 	defer cancel()
 
 	go func() {
@@ -170,7 +230,7 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 		}
 	}()
 
-	acl, te, entity, identityPolicies, err := c.fetchACLTokenEntryAndEntity(req)
+	acl, te, entity, identityPolicies, err := c.fetchACLTokenEntryAndEntity(ctx, req)
 	if err != nil {
 		retErr = multierror.Append(retErr, err)
 		return retErr
@@ -178,19 +238,22 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 
 	// Audit-log the request before going any further
 	auth := &logical.Auth{
-		ClientToken:      req.ClientToken,
-		Policies:         identityPolicies,
-		IdentityPolicies: identityPolicies,
+		ClientToken: req.ClientToken,
+		Accessor:    req.ClientTokenAccessor,
 	}
 	if te != nil {
+		auth.IdentityPolicies = identityPolicies[te.NamespaceID]
+		delete(identityPolicies, te.NamespaceID)
+		auth.ExternalNamespacePolicies = identityPolicies
 		auth.TokenPolicies = te.Policies
-		auth.Policies = append(te.Policies, identityPolicies...)
+		auth.Policies = append(te.Policies, identityPolicies[te.NamespaceID]...)
 		auth.Metadata = te.Meta
 		auth.DisplayName = te.DisplayName
 		auth.EntityID = te.EntityID
+		auth.TokenType = te.Type
 	}
 
-	logInput := &audit.LogInput{
+	logInput := &logical.LogInput{
 		Auth:    auth,
 		Request: req,
 	}
@@ -203,14 +266,12 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 	if entity != nil && entity.Disabled {
 		c.logger.Warn("permission denied as the entity on the token is disabled")
 		retErr = multierror.Append(retErr, logical.ErrPermissionDenied)
-		c.stateLock.RUnlock()
 		return retErr
 	}
 
 	if te != nil && te.EntityID != "" && entity == nil {
 		c.logger.Warn("permission denied as the entity on the token is invalid")
 		retErr = multierror.Append(retErr, logical.ErrPermissionDenied)
-		c.stateLock.RUnlock()
 		return retErr
 	}
 
@@ -233,21 +294,20 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 	authResults := c.performPolicyChecks(ctx, acl, te, req, entity, &PolicyCheckOpts{
 		RootPrivsRequired: true,
 	})
-	if authResults.Error.ErrorOrNil() != nil {
-		retErr = multierror.Append(retErr, authResults.Error)
-		return retErr
-	}
 	if !authResults.Allowed {
-		retErr = multierror.Append(retErr, logical.ErrPermissionDenied)
+		retErr = multierror.Append(retErr, authResults.Error)
+		if authResults.Error.ErrorOrNil() == nil || authResults.DeniedError {
+			retErr = multierror.Append(retErr, logical.ErrPermissionDenied)
+		}
 		return retErr
 	}
 
 	if te != nil && te.NumUses == tokenRevocationPending {
 		// Token needs to be revoked. We do this immediately here because
 		// we won't have a token store after sealing.
-		leaseID, err := c.expiration.CreateOrFetchRevocationLeaseByToken(te)
+		leaseID, err := c.expiration.CreateOrFetchRevocationLeaseByToken(c.activeContext, te)
 		if err == nil {
-			err = c.expiration.Revoke(ctx, leaseID)
+			err = c.expiration.Revoke(c.activeContext, leaseID)
 		}
 		if err != nil {
 			c.logger.Error("token needed revocation before step-down but failed to revoke", "error", err)
@@ -272,6 +332,7 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 	c.logger.Info("entering standby mode")
 
 	var g run.Group
+	newLeaderCh := addEnterpriseHaActors(c, &g)
 	{
 		// This will cause all the other actors to close when the stop channel
 		// is closed.
@@ -281,45 +342,39 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 		}, func(error) {})
 	}
 	{
-		// Monitor for key rotation
-		keyRotateDone := make(chan struct{})
+		// Monitor for key rotations
 		keyRotateStop := make(chan struct{})
 
 		g.Add(func() error {
-			c.periodicCheckKeyUpgrade(context.Background(), keyRotateDone, keyRotateStop)
+			c.periodicCheckKeyUpgrades(context.Background(), keyRotateStop)
 			return nil
 		}, func(error) {
 			close(keyRotateStop)
 			c.logger.Debug("shutting down periodic key rotation checker")
-			<-keyRotateDone
 		})
 	}
 	{
 		// Monitor for new leadership
-		checkLeaderDone := make(chan struct{})
 		checkLeaderStop := make(chan struct{})
 
 		g.Add(func() error {
-			c.periodicLeaderRefresh(checkLeaderDone, checkLeaderStop)
+			c.periodicLeaderRefresh(newLeaderCh, checkLeaderStop)
 			return nil
 		}, func(error) {
 			close(checkLeaderStop)
 			c.logger.Debug("shutting down periodic leader refresh")
-			<-checkLeaderDone
 		})
 	}
 	{
 		// Wait for leadership
-		leaderDoneCh := make(chan struct{})
 		leaderStopCh := make(chan struct{})
 
 		g.Add(func() error {
-			c.waitForLeadership(leaderDoneCh, manualStepDownCh, leaderStopCh)
+			c.waitForLeadership(newLeaderCh, manualStepDownCh, leaderStopCh)
 			return nil
 		}, func(error) {
 			close(leaderStopCh)
 			c.logger.Debug("shutting down leader elections")
-			<-leaderDoneCh
 		})
 	}
 
@@ -330,11 +385,7 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 // waitForLeadership is a long running routine that is used when an HA backend
 // is enabled. It waits until we are leader and switches this Vault to
 // active.
-func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{}) {
-	defer close(doneCh)
-
-	c.logger.Info("entering standby mode")
-
+func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stopCh chan struct{}) {
 	var manualStepDown bool
 	for {
 		// Check for a shutdown
@@ -357,7 +408,7 @@ func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{})
 			c.logger.Error("failed to generate uuid", "error", err)
 			return
 		}
-		lock, err := c.ha.LockWith(coreLockPath, uuid)
+		lock, err := c.ha.LockWith(CoreLockPath, uuid)
 		if err != nil {
 			c.logger.Error("failed to create lock", "error", err)
 			return
@@ -370,43 +421,34 @@ func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{})
 		if leaderLostCh == nil {
 			return
 		}
+
+		if atomic.LoadUint32(c.neverBecomeActive) == 1 {
+			c.heldHALock = nil
+			lock.Unlock()
+			c.logger.Info("marked never become active, giving up active state")
+			continue
+		}
+
 		c.logger.Info("acquired lock, enabling active operation")
 
 		// This is used later to log a metrics event; this can be helpful to
 		// detect flapping
 		activeTime := time.Now()
 
-		// Grab the lock as we need it for cluster setup, which needs to happen
-		// before advertising;
+		continueCh := interruptPerfStandby(newLeaderCh, stopCh)
 
-		lockGrabbedCh := make(chan struct{})
-		go func() {
-			// Grab the lock
-			c.stateLock.Lock()
-			// If stopCh has been closed, which only happens while the
-			// stateLock is held, we have actually terminated, so we just
-			// instantly give up the lock, otherwise we notify that it's ready
-			// for consumption
-			select {
-			case <-stopCh:
-				c.stateLock.Unlock()
-			default:
-				close(lockGrabbedCh)
-			}
-		}()
-
-		select {
-		case <-stopCh:
+		// Grab the statelock or stop
+		if stopped := grabLockOrStop(c.stateLock.Lock, c.stateLock.Unlock, stopCh); stopped {
 			lock.Unlock()
+			close(continueCh)
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
 			return
-		case <-lockGrabbedCh:
-			// We now have the lock and can use it
 		}
 
 		if c.Sealed() {
 			c.logger.Warn("grabbed HA lock but already sealed, exiting")
 			lock.Unlock()
+			close(continueCh)
 			c.stateLock.Unlock()
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
 			return
@@ -415,52 +457,72 @@ func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{})
 		// Store the lock so that we can manually clear it later if needed
 		c.heldHALock = lock
 
-		// We haven't run postUnseal yet so we have nothing meaningful to use here
-		ctx := context.Background()
+		// Create the active context
+		activeCtx, activeCtxCancel := context.WithCancel(namespace.RootContext(nil))
+		c.activeContext = activeCtx
+		c.activeContextCancelFunc.Store(activeCtxCancel)
 
 		// This block is used to wipe barrier/seal state and verify that
 		// everything is sane. If we have no sanity in the barrier, we actually
 		// seal, as there's little we can do.
 		{
-			c.seal.SetBarrierConfig(ctx, nil)
+			c.seal.SetBarrierConfig(activeCtx, nil)
 			if c.seal.RecoveryKeySupported() {
-				c.seal.SetRecoveryConfig(ctx, nil)
+				c.seal.SetRecoveryConfig(activeCtx, nil)
 			}
 
-			if err := c.performKeyUpgrades(ctx); err != nil {
-				// We call this in a goroutine so that we can give up the
-				// statelock and have this shut us down; sealInternal has a
-				// workflow where it watches for the stopCh to close so we want
-				// to return from here
+			if err := c.performKeyUpgrades(activeCtx); err != nil {
 				c.logger.Error("error performing key upgrades", "error", err)
-				go c.Shutdown()
+
+				// If we fail due to anything other than a context canceled
+				// error we should shutdown as we may have the incorrect Keys.
+				if !strings.Contains(err.Error(), context.Canceled.Error()) {
+					// We call this in a goroutine so that we can give up the
+					// statelock and have this shut us down; sealInternal has a
+					// workflow where it watches for the stopCh to close so we want
+					// to return from here
+					go c.Shutdown()
+				}
+
 				c.heldHALock = nil
 				lock.Unlock()
+				close(continueCh)
 				c.stateLock.Unlock()
 				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-				return
+
+				// If we are shutting down we should return from this function,
+				// otherwise continue
+				if !strings.Contains(err.Error(), context.Canceled.Error()) {
+					continue
+				} else {
+					return
+				}
 			}
 		}
 
-		// Clear previous local cluster cert info so we generate new. Since the
-		// UUID will have changed, standbys will know to look for new info
-		c.localClusterParsedCert.Store((*x509.Certificate)(nil))
-		c.localClusterCert.Store(([]byte)(nil))
-		c.localClusterPrivateKey.Store((*ecdsa.PrivateKey)(nil))
+		{
+			// Clear previous local cluster cert info so we generate new. Since the
+			// UUID will have changed, standbys will know to look for new info
+			c.localClusterParsedCert.Store((*x509.Certificate)(nil))
+			c.localClusterCert.Store(([]byte)(nil))
+			c.localClusterPrivateKey.Store((*ecdsa.PrivateKey)(nil))
 
-		if err := c.setupCluster(ctx); err != nil {
-			c.heldHALock = nil
-			lock.Unlock()
-			c.stateLock.Unlock()
-			c.logger.Error("cluster setup failed", "error", err)
-			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-			continue
+			if err := c.setupCluster(activeCtx); err != nil {
+				c.heldHALock = nil
+				lock.Unlock()
+				close(continueCh)
+				c.stateLock.Unlock()
+				c.logger.Error("cluster setup failed", "error", err)
+				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+				continue
+			}
+
 		}
-
 		// Advertise as leader
-		if err := c.advertiseLeader(ctx, uuid, leaderLostCh); err != nil {
+		if err := c.advertiseLeader(activeCtx, uuid, leaderLostCh); err != nil {
 			c.heldHALock = nil
 			lock.Unlock()
+			close(continueCh)
 			c.stateLock.Unlock()
 			c.logger.Error("leader advertisement setup failed", "error", err)
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
@@ -468,11 +530,13 @@ func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{})
 		}
 
 		// Attempt the post-unseal process
-		err = c.postUnseal()
+		err = c.postUnseal(activeCtx, activeCtxCancel, standardUnsealStrategy{})
 		if err == nil {
 			c.standby = false
+			c.leaderUUID = uuid
 		}
 
+		close(continueCh)
 		c.stateLock.Unlock()
 
 		// Handle a failure to unseal
@@ -483,69 +547,107 @@ func (c *Core) waitForLeadership(doneCh, manualStepDownCh, stopCh chan struct{})
 			continue
 		}
 
-		runSealing := func() {
-			metrics.MeasureSince([]string{"core", "leadership_lost"}, activeTime)
-
-			// Tell any requests that know about this to stop
-			if c.activeContextCancelFunc != nil {
-				c.activeContextCancelFunc()
-			}
-
-			c.standby = true
-
-			if err := c.preSeal(); err != nil {
-				c.logger.Error("pre-seal teardown failed", "error", err)
-			}
-		}
-
-		releaseHALock := func() {
-			// We may hit this from leaderLostCh or manualStepDownCh if they
-			// triggered before stopCh, so we check here instead of only in the
-			// stopCh case so we can try to do the right thing then, too
-			if atomic.LoadUint32(c.keepHALockOnStepDown) == 1 {
-				return
-			}
-			if err := c.clearLeader(uuid); err != nil {
-				c.logger.Error("clearing leader advertisement failed", "error", err)
-			}
-			c.heldHALock.Unlock()
-			c.heldHALock = nil
-		}
-
 		// Monitor a loss of leadership
 		select {
 		case <-leaderLostCh:
 			c.logger.Warn("leadership lost, stopping active operation")
-
-			c.stateLock.Lock()
-			runSealing()
-			releaseHALock()
-			c.stateLock.Unlock()
-
 		case <-stopCh:
-			runSealing()
-			releaseHALock()
-			return
-
 		case <-manualStepDownCh:
 			manualStepDown = true
 			c.logger.Warn("stepping down from active operation to standby")
+		}
 
-			c.stateLock.Lock()
-			runSealing()
-			releaseHALock()
+		// Stop Active Duty
+		{
+			// Spawn this in a go routine so we can cancel the context and
+			// unblock any inflight requests that are holding the statelock.
+			go func() {
+				select {
+				case <-activeCtx.Done():
+				// Attempt to drain any inflight requests
+				case <-time.After(DefaultMaxRequestDuration):
+					activeCtxCancel()
+				}
+			}()
+
+			// Grab lock if we are not stopped
+			stopped := grabLockOrStop(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
+
+			// Cancel the context incase the above go routine hasn't done it
+			// yet
+			activeCtxCancel()
+			metrics.MeasureSince([]string{"core", "leadership_lost"}, activeTime)
+
+			// Mark as standby
+			c.standby = true
+			c.leaderUUID = ""
+
+			// Seal
+			if err := c.preSeal(); err != nil {
+				c.logger.Error("pre-seal teardown failed", "error", err)
+			}
+
+			// If we are not meant to keep the HA lock, clear it
+			if atomic.LoadUint32(c.keepHALockOnStepDown) == 0 {
+				if err := c.clearLeader(uuid); err != nil {
+					c.logger.Error("clearing leader advertisement failed", "error", err)
+				}
+
+				if err := c.heldHALock.Unlock(); err != nil {
+					c.logger.Error("unlocking HA lock failed", "error", err)
+				}
+				c.heldHALock = nil
+			}
+
+			// If we are stopped return, otherwise unlock the statelock
+			if stopped {
+				return
+			}
 			c.stateLock.Unlock()
 		}
 	}
+}
+
+// grabLockOrStop returns true if we failed to get the lock before stopCh
+// was closed.  Returns false if the lock was obtained, in which case it's
+// the caller's responsibility to unlock it.
+func grabLockOrStop(lockFunc, unlockFunc func(), stopCh chan struct{}) (stopped bool) {
+	// Grab the lock as we need it for cluster setup, which needs to happen
+	// before advertising;
+	lockGrabbedCh := make(chan struct{})
+	go func() {
+		// Grab the lock
+		lockFunc()
+		// If stopCh has been closed, which only happens while the
+		// stateLock is held, we have actually terminated, so we just
+		// instantly give up the lock, otherwise we notify that it's ready
+		// for consumption
+		select {
+		case <-stopCh:
+			unlockFunc()
+		default:
+			close(lockGrabbedCh)
+		}
+	}()
+
+	select {
+	case <-stopCh:
+		return true
+	case <-lockGrabbedCh:
+		// We now have the lock and can use it
+	}
+
+	return false
 }
 
 // This checks the leader periodically to ensure that we switch RPC to a new
 // leader pretty quickly. There is logic in Leader() already to not make this
 // onerous and avoid more traffic than needed, so we just call that and ignore
 // the result.
-func (c *Core) periodicLeaderRefresh(doneCh, stopCh chan struct{}) {
-	defer close(doneCh)
+func (c *Core) periodicLeaderRefresh(newLeaderCh chan func(), stopCh chan struct{}) {
 	opCount := new(int32)
+
+	clusterAddr := ""
 	for {
 		select {
 		case <-time.After(leaderCheckInterval):
@@ -561,7 +663,24 @@ func (c *Core) periodicLeaderRefresh(doneCh, stopCh chan struct{}) {
 			go func() {
 				// Bind locally, as the race detector is tripping here
 				lopCount := opCount
-				c.Leader()
+				isLeader, _, newClusterAddr, _ := c.Leader()
+
+				// If we are the leader reset the clusterAddr since the next
+				// failover might go to the node that was previously active.
+				if isLeader {
+					clusterAddr = ""
+				}
+
+				if !isLeader && newClusterAddr != clusterAddr && newLeaderCh != nil {
+					select {
+					case newLeaderCh <- nil:
+						c.logger.Debug("new leader found, triggering new leader channel")
+						clusterAddr = newClusterAddr
+					default:
+						c.logger.Debug("new leader found, but still processing previous leader change")
+					}
+
+				}
 				atomic.AddInt32(lopCount, -1)
 			}()
 		case <-stopCh:
@@ -571,9 +690,9 @@ func (c *Core) periodicLeaderRefresh(doneCh, stopCh chan struct{}) {
 }
 
 // periodicCheckKeyUpgrade is used to watch for key rotation events as a standby
-func (c *Core) periodicCheckKeyUpgrade(ctx context.Context, doneCh, stopCh chan struct{}) {
-	defer close(doneCh)
+func (c *Core) periodicCheckKeyUpgrades(ctx context.Context, stopCh chan struct{}) {
 	opCount := new(int32)
+	_, isRaft := c.underlyingPhysical.(*raft.RaftBackend)
 	for {
 		select {
 		case <-time.After(keyRotateCheckInterval):
@@ -602,13 +721,20 @@ func (c *Core) periodicCheckKeyUpgrade(ctx context.Context, doneCh, stopCh chan 
 				entry, _ := c.barrier.Get(ctx, poisonPillPath)
 				if entry != nil && len(entry.Value) > 0 {
 					c.logger.Warn("encryption keys have changed out from underneath us (possibly due to replication enabling), must be unsealed again")
-					go c.Shutdown()
+					// If we are using raft storage we do not want to shut down
+					// raft during replication secondary enablement. This will
+					// allow us to keep making progress on the raft log.
+					go c.sealInternalWithOptions(true, false, !isRaft)
 					atomic.AddInt32(lopCount, -1)
 					return
 				}
 
 				if err := c.checkKeyUpgrades(ctx); err != nil {
 					c.logger.Error("key rotation periodic upgrade check failed", "error", err)
+				}
+
+				if err := c.checkRaftTLSKeyUpgrades(ctx); err != nil {
+					c.logger.Error("raft tls periodic upgrade check failed", "error", err)
 				}
 
 				atomic.AddInt32(lopCount, -1)
@@ -641,17 +767,56 @@ func (c *Core) checkKeyUpgrades(ctx context.Context) error {
 	return nil
 }
 
+func (c *Core) reloadMasterKey(ctx context.Context) error {
+	if err := c.barrier.ReloadMasterKey(ctx); err != nil {
+		return errwrap.Wrapf("error reloading master key: {{err}}", err)
+	}
+	return nil
+}
+
+func (c *Core) reloadShamirKey(ctx context.Context) error {
+	_ = c.seal.SetBarrierConfig(ctx, nil)
+	if cfg, _ := c.seal.BarrierConfig(ctx); cfg == nil {
+		return nil
+	}
+	var shamirKey []byte
+	switch c.seal.StoredKeysSupported() {
+	case StoredKeysSupportedGeneric:
+		return nil
+	case StoredKeysSupportedShamirMaster:
+		entry, err := c.barrier.Get(ctx, shamirKekPath)
+		if err != nil {
+			return err
+		}
+		if entry == nil {
+			return nil
+		}
+		shamirKey = entry.Value
+	case StoredKeysNotSupported:
+		keyring, err := c.barrier.Keyring()
+		if err != nil {
+			return errwrap.Wrapf("failed to update seal access: {{err}}", err)
+		}
+		shamirKey = keyring.masterKey
+	}
+	return c.seal.GetAccess().(*shamir.ShamirSeal).SetKey(shamirKey)
+}
+
 func (c *Core) performKeyUpgrades(ctx context.Context) error {
 	if err := c.checkKeyUpgrades(ctx); err != nil {
 		return errwrap.Wrapf("error checking for key upgrades: {{err}}", err)
 	}
 
-	if err := c.barrier.ReloadMasterKey(ctx); err != nil {
+	if err := c.reloadMasterKey(ctx); err != nil {
 		return errwrap.Wrapf("error reloading master key: {{err}}", err)
 	}
 
 	if err := c.barrier.ReloadKeyring(ctx); err != nil {
 		return errwrap.Wrapf("error reloading keyring: {{err}}", err)
+	}
+
+	if err := c.reloadShamirKey(ctx); err != nil {
+		return errwrap.Wrapf("error reloading shamir kek key: {{err}}", err)
 	}
 
 	if err := c.scheduleUpgradeCleanup(ctx); err != nil {
@@ -676,7 +841,7 @@ func (c *Core) scheduleUpgradeCleanup(ctx context.Context) error {
 	}
 
 	// Schedule cleanup for all of them
-	time.AfterFunc(keyRotateGracePeriod, func() {
+	time.AfterFunc(KeyRotateGracePeriod, func() {
 		sealed, err := c.barrier.Sealed()
 		if err != nil {
 			c.logger.Warn("failed to check barrier status at upgrade cleanup time")
@@ -717,7 +882,9 @@ func (c *Core) acquireLock(lock physical.Lock, stopCh <-chan struct{}) <-chan st
 
 // advertiseLeader is used to advertise the current node as leader
 func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-chan struct{}) error {
-	go c.cleanLeaderPrefix(ctx, uuid, leaderLostCh)
+	if leaderLostCh != nil {
+		go c.cleanLeaderPrefix(ctx, uuid, leaderLostCh)
+	}
 
 	var key *ecdsa.PrivateKey
 	switch c.localClusterPrivateKey.Load().(type) {
@@ -728,7 +895,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-
 		return fmt.Errorf("unknown cluster private key type %T", c.localClusterPrivateKey.Load())
 	}
 
-	keyParams := &clusterKeyParams{
+	keyParams := &certutil.ClusterKeyParams{
 		Type: corePrivateKeyTypeP521,
 		X:    key.X,
 		Y:    key.Y,
@@ -740,7 +907,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-
 	copy(localCert, locCert)
 	adv := &activeAdvertisement{
 		RedirectAddr:     c.redirectAddr,
-		ClusterAddr:      c.clusterAddr,
+		ClusterAddr:      c.ClusterAddr(),
 		ClusterCert:      localCert,
 		ClusterKeyParams: keyParams,
 	}
@@ -748,7 +915,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-
 	if err != nil {
 		return err
 	}
-	ent := &Entry{
+	ent := &logical.StorageEntry{
 		Key:   coreLeaderPrefix + uuid,
 		Value: val,
 	}
@@ -803,4 +970,12 @@ func (c *Core) clearLeader(uuid string) error {
 	}
 
 	return err
+}
+
+func (c *Core) SetNeverBecomeActive(on bool) {
+	if on {
+		atomic.StoreUint32(c.neverBecomeActive, 1)
+	} else {
+		atomic.StoreUint32(c.neverBecomeActive, 0)
+	}
 }

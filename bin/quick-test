@@ -4,7 +4,7 @@ set -e
 export VAULT_ADDR=http://localhost:8200
 
 TTL=1000
-ADMINNAME="ConorAdmin"
+ADMINNAME="VaultKafkaPlugin"
 DATA=$(vault write -format=json pki/issue/kafka-clients common_name="$ADMINNAME" ttl=$TTL | jq -r .data)
 
 echo "Hello $NAME"
@@ -13,7 +13,7 @@ CERT=$(printf "%s" "$DATA" | jq -r .certificate)
 CA=$(printf "%s" "$DATA" | jq -r .issuing_ca)
 
 echo "  Configuring Provider"
-vault write kafka/config/access address="localhost:9092" ca_certificate="$CA" client_certificate="$CERT" client_key="$PRIVATE_KEY"
+vault write kafka/config/access address="192.168.0.248:9092" ca_certificate="$CA" client_certificate="$CERT" client_key="$PRIVATE_KEY" tls_enabled=true
 echo "  Writing Policy"
 vault write kafka/roles/read-all-topics policy="$(cat bin/policy.json)"
 

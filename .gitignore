@@ -1,0 +1,4 @@
+vault-plugin-secrets-kafka
+sample-app/ca.crt
+sample-app/client.crt
+sample-app/private.key

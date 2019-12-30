@@ -12,8 +12,8 @@ import (
 	"os"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/hashicorp/vault/helper/compressutil"
-	"github.com/hashicorp/vault/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/helper/compressutil"
+	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 )
 
 type bufCloser struct {
@@ -39,7 +39,7 @@ func GenerateForwardedHTTPRequest(req *http.Request, addr string) (*http.Request
 		newBody, err = jsonutil.EncodeJSON(fq)
 	case "json_compress":
 		newBody, err = jsonutil.EncodeJSONAndCompress(fq, &compressutil.CompressionConfig{
-			Type: compressutil.CompressionTypeLzw,
+			Type: compressutil.CompressionTypeLZW,
 		})
 	case "proto3":
 		fallthrough

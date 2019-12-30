@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/vault/helper/consts"
 	"github.com/hashicorp/vault/helper/pgpkeys"
 	"github.com/hashicorp/vault/helper/xor"
+	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/shamir"
 )
 
@@ -20,17 +21,34 @@ var (
 	// GenerateStandardRootTokenStrategy is the strategy used to generate a
 	// typical root token
 	GenerateStandardRootTokenStrategy GenerateRootStrategy = generateStandardRootToken{}
+
+	// GenerateDROperationTokenStrategy is the strategy used to generate a
+	// DR operational token
+	GenerateDROperationTokenStrategy GenerateRootStrategy = generateStandardRootToken{}
 )
 
 // GenerateRootStrategy allows us to swap out the strategy we want to use to
 // create a token upon completion of the generate root process.
 type GenerateRootStrategy interface {
 	generate(context.Context, *Core) (string, func(), error)
+	authenticate(context.Context, *Core, []byte) error
 }
 
 // generateStandardRootToken implements the GenerateRootStrategy and is in
 // charge of creating standard root tokens.
 type generateStandardRootToken struct{}
+
+func (g generateStandardRootToken) authenticate(ctx context.Context, c *Core, combinedKey []byte) error {
+	masterKey, err := c.unsealKeyToMasterKey(ctx, combinedKey)
+	if err != nil {
+		return errwrap.Wrapf("unable to authenticate: {{err}}", err)
+	}
+	if err := c.barrier.VerifyMaster(masterKey); err != nil {
+		return errwrap.Wrapf("master key verification failed: {{err}}", err)
+	}
+
+	return nil
+}
 
 func (g generateStandardRootToken) generate(ctx context.Context, c *Core) (string, func(), error) {
 	te, err := c.tokenStore.rootToken(ctx)
@@ -73,10 +91,10 @@ type GenerateRootResult struct {
 func (c *Core) GenerateRootProgress() (int, error) {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	if c.Sealed() {
+	if c.Sealed() && !c.recoveryMode {
 		return 0, consts.ErrSealed
 	}
-	if c.standby {
+	if c.standby && !c.recoveryMode {
 		return 0, consts.ErrStandby
 	}
 
@@ -91,10 +109,10 @@ func (c *Core) GenerateRootProgress() (int, error) {
 func (c *Core) GenerateRootConfiguration() (*GenerateRootConfig, error) {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	if c.Sealed() {
+	if c.Sealed() && !c.recoveryMode {
 		return nil, consts.ErrSealed
 	}
-	if c.standby {
+	if c.standby && !c.recoveryMode {
 		return nil, consts.ErrStandby
 	}
 
@@ -117,12 +135,8 @@ func (c *Core) GenerateRootInit(otp, pgpKey string, strategy GenerateRootStrateg
 	var fingerprint string
 	switch {
 	case len(otp) > 0:
-		otpBytes, err := base64.StdEncoding.DecodeString(otp)
-		if err != nil {
-			return errwrap.Wrapf("error decoding base64 OTP value: {{err}}", err)
-		}
-		if otpBytes == nil || len(otpBytes) != 16 {
-			return fmt.Errorf("decoded OTP value is invalid or wrong length")
+		if len(otp) != TokenLength+2 {
+			return fmt.Errorf("OTP string is wrong length")
 		}
 
 	case len(pgpKey) > 0:
@@ -136,15 +150,22 @@ func (c *Core) GenerateRootInit(otp, pgpKey string, strategy GenerateRootStrateg
 		fingerprint = fingerprints[0]
 
 	default:
-		return fmt.Errorf("unreachable condition")
+		return fmt.Errorf("otp or pgp_key parameter must be provided")
 	}
 
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	if c.Sealed() {
+	if c.Sealed() && !c.recoveryMode {
 		return consts.ErrSealed
 	}
-	if c.standby {
+	barrierSealed, err := c.barrier.Sealed()
+	if err != nil {
+		return errors.New("unable to check barrier seal status")
+	}
+	if !barrierSealed && c.recoveryMode {
+		return errors.New("attempt to generate recovery operation token when already unsealed")
+	}
+	if c.standby && !c.recoveryMode {
 		return consts.ErrStandby
 	}
 
@@ -171,8 +192,16 @@ func (c *Core) GenerateRootInit(otp, pgpKey string, strategy GenerateRootStrateg
 	}
 
 	if c.logger.IsInfo() {
-		c.logger.Info("root generation initialized", "nonce", c.generateRootConfig.Nonce)
+		switch strategy.(type) {
+		case generateStandardRootToken:
+			c.logger.Info("root generation initialized", "nonce", c.generateRootConfig.Nonce)
+		case *generateRecoveryToken:
+			c.logger.Info("recovery operation token generation initialized", "nonce", c.generateRootConfig.Nonce)
+		default:
+			c.logger.Info("dr operation token generation initialized", "nonce", c.generateRootConfig.Nonce)
+		}
 	}
+
 	return nil
 }
 
@@ -211,10 +240,19 @@ func (c *Core) GenerateRootUpdate(ctx context.Context, key []byte, nonce string,
 	// Ensure we are already unsealed
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	if c.Sealed() {
+	if c.Sealed() && !c.recoveryMode {
 		return nil, consts.ErrSealed
 	}
-	if c.standby {
+
+	barrierSealed, err := c.barrier.Sealed()
+	if err != nil {
+		return nil, errors.New("unable to check barrier seal status")
+	}
+	if !barrierSealed && c.recoveryMode {
+		return nil, errors.New("attempt to generate recovery operation token when already unsealed")
+	}
+
+	if c.standby && !c.recoveryMode {
 		return nil, consts.ErrStandby
 	}
 
@@ -257,72 +295,54 @@ func (c *Core) GenerateRootUpdate(ctx context.Context, key []byte, nonce string,
 		}, nil
 	}
 
-	// Recover the master key
-	var masterKey []byte
+	// Combine the key parts
+	var combinedKey []byte
 	if config.SecretThreshold == 1 {
-		masterKey = c.generateRootProgress[0]
+		combinedKey = c.generateRootProgress[0]
 		c.generateRootProgress = nil
 	} else {
-		masterKey, err = shamir.Combine(c.generateRootProgress)
+		combinedKey, err = shamir.Combine(c.generateRootProgress)
 		c.generateRootProgress = nil
 		if err != nil {
 			return nil, errwrap.Wrapf("failed to compute master key: {{err}}", err)
 		}
 	}
 
-	// Verify the master key
-	if c.seal.RecoveryKeySupported() {
-		if err := c.seal.VerifyRecoveryKey(ctx, masterKey); err != nil {
-			c.logger.Error("root generation aborted, recovery key verification failed", "error", err)
-			return nil, err
-		}
-	} else {
-		if err := c.barrier.VerifyMaster(masterKey); err != nil {
-			c.logger.Error("root generation aborted, master key verification failed", "error", err)
-			return nil, err
-		}
+	if err := strategy.authenticate(ctx, c, combinedKey); err != nil {
+		c.logger.Error("root generation aborted", "error", err.Error())
+		return nil, errwrap.Wrapf("root generation aborted: {{err}}", err)
 	}
 
 	// Run the generate strategy
-	tokenUUID, cleanupFunc, err := strategy.generate(ctx, c)
+	token, cleanupFunc, err := strategy.generate(ctx, c)
 	if err != nil {
 		return nil, err
-	}
-
-	uuidBytes, err := uuid.ParseUUID(tokenUUID)
-	if err != nil {
-		cleanupFunc()
-		c.logger.Error("error getting generated token bytes", "error", err)
-		return nil, err
-	}
-	if uuidBytes == nil {
-		cleanupFunc()
-		c.logger.Error("got nil parsed UUID bytes")
-		return nil, fmt.Errorf("got nil parsed UUID bytes")
 	}
 
 	var tokenBytes []byte
+
 	// Get the encoded value first so that if there is an error we don't create
 	// the root token.
 	switch {
 	case len(c.generateRootConfig.OTP) > 0:
 		// This function performs decoding checks so rather than decode the OTP,
 		// just encode the value we're passing in.
-		tokenBytes, err = xor.XORBase64(c.generateRootConfig.OTP, base64.StdEncoding.EncodeToString(uuidBytes))
+		tokenBytes, err = xor.XORBytes([]byte(c.generateRootConfig.OTP), []byte(token))
 		if err != nil {
 			cleanupFunc()
 			c.logger.Error("xor of root token failed", "error", err)
 			return nil, err
 		}
+		token = base64.RawStdEncoding.EncodeToString(tokenBytes)
 
 	case len(c.generateRootConfig.PGPKey) > 0:
-		_, tokenBytesArr, err := pgpkeys.EncryptShares([][]byte{[]byte(tokenUUID)}, []string{c.generateRootConfig.PGPKey})
+		_, tokenBytesArr, err := pgpkeys.EncryptShares([][]byte{[]byte(token)}, []string{c.generateRootConfig.PGPKey})
 		if err != nil {
 			cleanupFunc()
 			c.logger.Error("error encrypting new root token", "error", err)
 			return nil, err
 		}
-		tokenBytes = tokenBytesArr[0]
+		token = base64.StdEncoding.EncodeToString(tokenBytesArr[0])
 
 	default:
 		cleanupFunc()
@@ -332,12 +352,17 @@ func (c *Core) GenerateRootUpdate(ctx context.Context, key []byte, nonce string,
 	results := &GenerateRootResult{
 		Progress:       progress,
 		Required:       config.SecretThreshold,
-		EncodedToken:   base64.StdEncoding.EncodeToString(tokenBytes),
+		EncodedToken:   token,
 		PGPFingerprint: c.generateRootConfig.PGPFingerprint,
 	}
 
-	if c.logger.IsInfo() {
+	switch strategy.(type) {
+	case generateStandardRootToken:
 		c.logger.Info("root generation finished", "nonce", c.generateRootConfig.Nonce)
+	case *generateRecoveryToken:
+		c.logger.Info("recovery operation token generation finished", "nonce", c.generateRootConfig.Nonce)
+	default:
+		c.logger.Info("dr operation token generation finished", "nonce", c.generateRootConfig.Nonce)
 	}
 
 	c.generateRootProgress = nil
@@ -349,10 +374,10 @@ func (c *Core) GenerateRootUpdate(ctx context.Context, key []byte, nonce string,
 func (c *Core) GenerateRootCancel() error {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	if c.Sealed() {
+	if c.Sealed() && !c.recoveryMode {
 		return consts.ErrSealed
 	}
-	if c.standby {
+	if c.standby && !c.recoveryMode {
 		return consts.ErrStandby
 	}
 
