@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathConfigAccess() *framework.Path {
@@ -93,6 +93,6 @@ func pathConfigAccessWrite(ctx context.Context, req *logical.Request, data *fram
 		return nil, err
 	}
 
-	log.Printf("[INFO] ALL WENT OK")
+	log.Printf("[INFO] Successfully configured backend")
 	return nil, nil
 }

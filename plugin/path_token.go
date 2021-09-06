@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/errwrap"
 	uuid "github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 const (
@@ -49,7 +48,7 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 	log.Printf("[INFO] Retrieving role %s", role)
 	entry, err := req.Storage.Get(ctx, "policy/"+role)
 	if err != nil {
-		return nil, errwrap.Wrapf("error retrieving role: {{err}}", err)
+		return nil, fmt.Errorf("error retrieving role: %s", err)
 	}
 	if entry == nil {
 		return logical.ErrorResponse(fmt.Sprintf("role %q not found", role)), nil
@@ -172,7 +171,7 @@ func (b *backend) secretTokenRenew(ctx context.Context, req *logical.Request, d 
 
 	entry, err := req.Storage.Get(ctx, "policy/"+role)
 	if err != nil {
-		return nil, errwrap.Wrapf("error retrieving role: {{err}}", err)
+		return nil, fmt.Errorf("error retrieving role: %s", err)
 	}
 	if entry == nil {
 		return logical.ErrorResponse(fmt.Sprintf("issuing role %q not found", role)), nil
