@@ -8,9 +8,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/Mongey/terraform-provider-kafka/kafka"
-	"github.com/hashicorp/errwrap"
-	"github.com/hashicorp/vault/logical"
+	"github.com/Mongey/vault-plugin-secrets-kafka/kafka"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 type accessConfig struct {
@@ -26,18 +25,7 @@ func (a *accessConfig) cert() (tls.Certificate, error) {
 	return tls.X509KeyPair([]byte(a.ClientCert), []byte(a.ClientKey))
 }
 
-func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error) {
-	conf, userErr, intErr := readConfigAccess(ctx, s)
-	if intErr != nil {
-		return nil, nil, intErr
-	}
-	if userErr != nil {
-		return nil, userErr, nil
-	}
-	if conf == nil {
-		return nil, nil, fmt.Errorf("no error received but no configuration found")
-	}
-
+func (conf *accessConfig) config() (*kafka.Config, error) {
 	kafkaConfig := &kafka.Config{
 		BootstrapServers: &[]string{conf.Address},
 		TLSEnabled:       conf.TLSEnabled,
@@ -49,7 +37,7 @@ func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error
 	if err == nil {
 		kafkaConfig.ClientCert = &cert
 	} else {
-		return nil, err, nil
+		return nil, err
 	}
 
 	log.Printf("[DEBUG] CA certicate being loaded")
@@ -57,10 +45,31 @@ func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error
 	var cacert *x509.Certificate
 	cacert, err = x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, err, nil
+		return nil, err
 	}
 	if cacert != nil {
 		kafkaConfig.CACert = cacert
+	}
+
+	return kafkaConfig, nil
+}
+
+func client(ctx context.Context, s logical.Storage) (*kafka.Client, error, error) {
+	conf, userErr, intErr := readConfigAccess(ctx, s)
+
+	if intErr != nil {
+		return nil, nil, intErr
+	}
+	if userErr != nil {
+		return nil, userErr, nil
+	}
+	if conf == nil {
+		return nil, nil, fmt.Errorf("no error received but no configuration found")
+	}
+
+	kafkaConfig, err := conf.config()
+	if err != nil {
+		return nil, err, nil
 	}
 
 	log.Printf("[DEBUG] Creating Client")
@@ -80,7 +89,7 @@ func readConfigAccess(ctx context.Context, storage logical.Storage) (*accessConf
 
 	conf := &accessConfig{}
 	if err := entry.DecodeJSON(conf); err != nil {
-		return nil, nil, errwrap.Wrapf("error reading consul access configuration: {{err}}", err)
+		return nil, nil, fmt.Errorf("error reading consul access configuration: %s", err)
 	}
 
 	return conf, nil, nil

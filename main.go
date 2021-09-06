@@ -1,30 +1,35 @@
 package main
 
 import (
+	"log"
 	"os"
 
 	k "github.com/Mongey/vault-plugin-secrets-kafka/plugin"
-	hclog "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/helper/pluginutil"
-	"github.com/hashicorp/vault/logical/plugin"
+	"github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/sdk/plugin"
 )
 
 func main() {
-	apiClientMeta := &pluginutil.APIClientMeta{}
+	apiClientMeta := &api.PluginAPIClientMeta{}
 	flags := apiClientMeta.FlagSet()
-	flags.Parse(os.Args[1:])
+	err := flags.Parse(os.Args[1:])
+	if err != nil {
+		log.Println(err)
+
+		os.Exit(1)
+	}
 
 	tlsConfig := apiClientMeta.GetTLSConfig()
-	tlsProviderFunc := pluginutil.VaultPluginTLSProvider(tlsConfig)
+	tlsProviderFunc := api.VaultPluginTLSProvider(tlsConfig)
 
-	err := plugin.Serve(&plugin.ServeOpts{
+	err = plugin.Serve(&plugin.ServeOpts{
 		BackendFactoryFunc: k.Factory,
 		TLSProviderFunc:    tlsProviderFunc,
 	})
-	if err != nil {
-		logger := hclog.New(&hclog.LoggerOptions{})
 
-		logger.Error("plugin shutting down", "error", err)
+	if err != nil {
+		log.Println(err)
+
 		os.Exit(1)
 	}
 }
