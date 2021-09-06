@@ -5,7 +5,7 @@ go 1.17
 require (
 	github.com/Mongey/terraform-provider-kafka v0.3.3
 	github.com/Shopify/sarama v1.29.1
-	github.com/hashicorp/errwrap v1.0.0
+	github.com/hashicorp/errwrap v1.1.0
 	github.com/hashicorp/go-hclog v0.12.0
 	github.com/hashicorp/go-uuid v1.0.2
 	github.com/hashicorp/vault v0.10.4
